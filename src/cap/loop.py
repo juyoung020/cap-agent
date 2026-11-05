@@ -21,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send, interrupt
 
 from . import agents as sub
+from . import autoreview
 from . import extras as ext
 from . import sandbox as sbx
 from . import memory as mem
@@ -114,9 +115,11 @@ HUMAN_ONLY = ("instructions", "test_edit", "memory", "scope", "sandbox_escape", 
 WIN_RUN_SCHEMA = {"type": "function", "function": {
     "name": "run",
     "description": ("Run a Windows cmd.exe command in the workspace, inside a sandbox: it can read and write only the "
-                    "workspace, has no network, and other folders are invisible. Use cmd syntax, not bash: "
-                    "`type file`, `python ...`, `python -m pytest -q`, `git ...`, join steps with &&. To list files "
-                    "use the glob tool (`dir` does not work in the sandbox). "
+                    "workspace, has no network, and other folders are invisible. Unix basics work here: "
+                    "`ls cat head tail grep wc find rm cp mv mkdir -p touch pwd which`, `sed -n 'A,Bp' file`, "
+                    "`diff -u a b`, pipes, `&&`, `> file`, `python ...`, `python -m pytest -q`, `git ...`. "
+                    "Bash-only syntax does not: no `$(...)`, `for` loops, `[[ ]]`, `$VAR` or heredocs (cmd uses "
+                    "%VAR%). Edit files with edit_file, not sed. "
                     "Set background=true for servers or watchers. If something truly needs more, retry with "
                     "escalate=true (the user is asked)."),
     "parameters": {"type": "object", "properties": {
@@ -124,7 +127,8 @@ WIN_RUN_SCHEMA = {"type": "function", "function": {
         "required": ["cmd"]}}}
 DATA_TOOLS = {"session_search", "read_file", "search", "run", "run_tests", "web_fetch", "web_search", "process",
               "list_mcp_resources", "read_mcp_resource"}
-MIDTURN_AT = 0.6             # 한 턴 안에서 맥락이 창의 60% 를 넘으면 이번 턴의 앞 단계를 요약으로 바꾼다
+GUARD_SAME_FILE = 3          # 진전 없이 같은 파일을 이만큼 읽으면 그만 읽으라고 알림
+MIDTURN_AT = 0.75            # 한 턴 안에서 맥락이 창의 75% 를 넘으면 이번 턴의 앞 단계를 줄인다(60% 는 시스템·도구 설명만으로 절반을 넘는 16k 창에서 거의 매번 압축해 같은 파일을 다시 읽게 했다 — 실사용)
 MIDTURN_KEEP = 6             # 최근 메시지 6개는 그대로
 MIDTURN_PROMPT = ("Summarize the steps above for yourself, to continue the same task with less context. In 4 short "
                   "sections: 1) what you did and found, 2) files you changed and how, 3) exact values/errors/names you "
@@ -312,6 +316,13 @@ def guard_check_after(hist: list) -> tuple[str, str]:
             if tool >= GUARD_TOOL_FAIL[0]:
                 return (f"\n[harness] {last['name']} has failed {tool} times without progress. "
                         "Step back: re-read the file or try a different approach."), ""
+    if last["name"] == "read_file" and last.get("path"):
+        # 같은 파일을 쪽만 바꿔 계속 다시 읽기(실사용: 압축으로 지워진 내용을 되찾으려 같은 파일을 7번 읽다 턴 한도)
+        n = sum(1 for h in since if h["name"] == "read_file" and h.get("path") == last["path"])
+        if n >= GUARD_SAME_FILE:
+            return (f"\n[harness] You have read {last['path']} {n} times in this request without changing anything. "
+                    "Do not read it again. Use the failure lines from the test output, search for the exact name "
+                    "you need (search with a pattern and this path), then make the change or state your diagnosis."), ""
     keys = [h["key"] for h in hist[-8:]]
     for per in (2, 3, 4):                    # A,B,A,B 같은 순환
         if len(keys) >= 2 * per and keys[-per:] == keys[-2 * per:-per] and len(set(keys[-per:])) > 1 \
@@ -796,6 +807,19 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
                     msgs.append({"role": "tool", "tool_call_id": call["id"],
                                  "content": f"Not applied (nothing was asked or changed): {why}"})
                     continue
+            if (chat and not child and d.verdict == "ask"
+                    and autoreview.applies(normalize_mode(approval_cfg.get("mode", "ask")), d.category)):
+                # 자동 검토(설정으로 켬): 사용자 요청과 이 호출만 보고 모델이 한 번 판단. 명시적 allow 만 허용
+                with busy("자동 검토 중"):
+                    rv = autoreview.review(ws, autoreview.user_request(state.get("goal", "")), call["name"],
+                                           call["args"], d.reason, d.category, ledger=ledger)
+                if rv["decision"] == "allow":
+                    d = type(d)("allow", f"approved by auto review: {rv['reason']}", d.category)
+                    call = {**call, "verdict": "allow", "reason": d.reason, "auto_review": True}
+                    emit("note", text=f"Auto review approved {call['name']}: {rv['reason'] or 'no reason given'}")
+                else:
+                    emit("note", text=f"Auto review left {call['name']} to you: "
+                                      f"{rv['reason'] or rv.get('error') or 'no reason given'}")
             if d.verdict == "deny":
                 say(f"권한 거부: {call['name']} — {d.reason}")
                 emit("deny", tool=call["name"], args=call["args"], reason=d.reason)
@@ -1097,7 +1121,8 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
                     say(f"[hook] {m_}"); emit("note", text=f"hook: {m_}")
             if chat:
                 progress = bool(res.get("changed")) and res.get("ok", True)
-                hist.append({"key": key, "name": c["name"], "ok": bool(res.get("ok", True)), "progress": progress})
+                hist.append({"key": key, "name": c["name"], "ok": bool(res.get("ok", True)), "progress": progress,
+                             **({"path": str(c["args"].get("path", ""))} if c["name"] == "read_file" else {})})
                 hist = hist[-30:]
                 warn, why = guard_check_after(hist)
                 if why and not stuck:

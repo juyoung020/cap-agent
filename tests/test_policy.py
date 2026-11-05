@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from cap.policy import classify, classify_command
@@ -19,7 +21,8 @@ def test_read_outside_needs_approval(ws):
 
 def test_write_outside_denied(ws):
     assert classify("write_file", {"path": "../evil.py", "content": ""}, ws).verdict == "deny"
-    assert classify("edit_file", {"path": "C:/Windows/x.txt", "old": "a", "new": "b"}, ws).verdict == "deny"
+    outside = "C:/Windows/x.txt" if os.name == "nt" else "/etc/x.txt"      # 리눅스에서 C:/… 는 상대 경로(작업 폴더 안)
+    assert classify("edit_file", {"path": outside, "old": "a", "new": "b"}, ws).verdict == "deny"
 
 
 def test_write_cap_dir_denied(ws):

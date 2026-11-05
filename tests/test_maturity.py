@@ -312,7 +312,8 @@ def test_clipboard_image_saves_png(tmp_path, monkeypatch):
     def fake_run(args, **kw):
         seen["args"] = args
         path = args[-1].split(".Save('")[1].split("',")[0]
-        Path(path).write_bytes(b"\x89PNG fake")
+        with open(path, "wb") as f:         # Path() 는 os.name 을 바꿔 둔 동안 리눅스에서 WindowsPath 가 된다
+            f.write(b"\x89PNG fake")
         return NS(returncode=0, stdout=b"ok", stderr=b"")
     monkeypatch.setattr(X.os, "name", "nt")
     monkeypatch.setattr(X.subprocess, "run", fake_run)

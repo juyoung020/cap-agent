@@ -106,6 +106,16 @@ def render_notebook(raw: str, out_max: int = 1500) -> str:
 OUTPUT_KEEP = 30   # .cap/outputs 에 남겨 두는 긴 출력 파일 수
 
 
+def with_failures(out: str, code: int | None) -> str:
+    """실패한 테스트 출력 맨 앞에 실패 요약(FAILED·E 줄·파일:줄). 긴 출력은 앞뒤만 남기므로 가운데의
+    '무엇이 왜 틀렸나'가 잘려 모델이 엉뚱한 파일을 헤맸다(실사용)."""
+    if not code:
+        return out
+    from .compact import failure_digest
+    digest = failure_digest(out)
+    return f"Failures (summary):\n{digest}\n--- full output ---\n{out}" if digest else out
+
+
 def spill(ws: Path, text: str, limit: int = MAX_OUT) -> str:
     """긴 출력은 머리·꼬리만 모델에 주고, 원문 전체는 .cap/outputs/ 에 남겨 이어 읽게 한다(Claude Code 방식).
     파일에도 비밀 값은 가린 채 쓴다."""
@@ -591,7 +601,8 @@ def shell_args(cmd: str, cwd: Path, sandbox: str = "", timeout: int | None = Non
         from . import sandbox as sb
         inner = cmd
         if sandbox == "appcontainer":          # Windows 격리: cmd.exe, venv 파이썬이 먼저 잡히게
-            inner = f'chcp 65001 >nul && set "PATH={first};%PATH%{";" + last if last else ""}" && {cmd}'
+            from .winutils import translate    # mkdir -p·dir·export·/dev/null 같은 bash 습관을 cmd 로(유닉스 명령은 .cap/sbx/bin)
+            inner = f'chcp 65001 >nul && set "PATH={first};%PATH%{";" + last if last else ""}" && {translate(cmd)}'
         elif sandbox != "wsl" and bash:          # 리눅스: venv 파이썬이 먼저 잡히게(WSL 은 리눅스 쪽 도구를 쓴다)
             inner = f'export PATH="{_bash_path(first)}:$PATH{":" + _bash_path(last) if last else ""}"; {cmd}'
         args, err = sb.wrap(inner, cwd, sandbox, timeout)
@@ -795,8 +806,11 @@ class ToolBox:
                 if len(out_lines) > 200:
                     break
         if not out_lines:
+            narrow = path not in ("", ".", "./") and self.p(path).is_file()
             return {"ok": True, "output": "(일치 없음) — try a shorter or simpler pattern (regex; lowercase = case-insensitive). "
-                                          "Hidden folders, .venv and secret files are skipped.", "changed": []}
+                                          "Hidden folders, .venv and secret files are skipped."
+                                          + (f" You searched only {path}; it may be defined elsewhere — search the whole "
+                                             "project (path \".\")." if narrow else ""), "changed": []}
         return {"ok": True, "output": clip("\n".join(out_lines[:200])), "changed": []}
 
     def t_edit_file(self, path: str, old: str = "", new: str = "", edits: list | None = None) -> dict:
@@ -1029,6 +1043,8 @@ class ToolBox:
                     f"process(action=\"output\", id=\"{pid}\", wait=30) or stop it with action=\"kill\"]")
             return {"ok": True, "output": spill(self.ws, f"{head}\n{out or '(no output yet)'}"), "changed": changed,
                     "exit": None, "background": pid}
+        if re.search(r"\b(pytest|unittest|npm (run )?test|cargo test|go test|make test)\b", cmd):
+            out = with_failures(out, code)      # 모델이 run 으로 돌린 테스트도 실패 요약을 앞에
         return {"ok": code == 0, "output": spill(self.ws, f"[exit {code}]\n{out}"), "changed": changed, "exit": code}
 
     def t_run_tests(self, target: str = "") -> dict:
@@ -1038,8 +1054,8 @@ class ToolBox:
             return {"ok": False, "output": bad, "changed": [], "exit": 2, "cmd": self.test_cmd, "test": True}
         cmd = self.test_cmd + (f" {target}" if target else "")
         code, out = run_shell(cmd, self.ws, sandbox=self._sandbox_for_this_call())
-        return {"ok": code == 0, "output": spill(self.ws, f"[{cmd} → exit {code}]\n{out}"), "changed": [], "exit": code,
-                "cmd": cmd, "test": True}
+        return {"ok": code == 0, "output": spill(self.ws, f"[{cmd} → exit {code}]\n{with_failures(out, code)}"),
+                "changed": [], "exit": code, "cmd": cmd, "test": True}
 
     def t_todo(self, items: list) -> dict:
         self.todos = [{"text": str(i.get("text", "")), "done": bool(i.get("done", False))}

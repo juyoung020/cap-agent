@@ -11,6 +11,10 @@ def _isolated_user_home(tmp_path_factory, monkeypatch):
     """사용자 기억·스킬·훅(~/.cap)은 실제 홈 대신 빈 임시 폴더를 보게 한다 — 이 PC 설정에 따라 결과가 바뀌지 않게."""
     home = tmp_path_factory.mktemp("home") / ".cap"
     monkeypatch.setenv("CAP_SKIP_SETUP_CHECK", "1")        # 처음 설정 안내는 test_setup.py 에서만
+    monkeypatch.setenv("CAP_NO_UPDATE_CHECK", "1")         # 새 버전 확인(네트워크)은 test_updates.py 에서만, 가짜 fetch 로
+    for k in ("GIT_AUTHOR", "GIT_COMMITTER"):               # git 사용자 설정이 없는 PC·CI 에서도 시험 저장소에 커밋되게
+        monkeypatch.setenv(f"{k}_NAME", "cap-test")
+        monkeypatch.setenv(f"{k}_EMAIL", "cap-test@example.invalid")
     from cap import hooks, mcp_client, memory
     monkeypatch.setattr(memory, "user_home", lambda: home)
     monkeypatch.setattr(hooks, "user_file", lambda: home / "hooks.json")

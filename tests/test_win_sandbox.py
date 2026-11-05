@@ -111,3 +111,25 @@ def test_project_venv_gets_its_base_python_and_file_grants(tmp_path, monkeypatch
     assert (str(base), "RX", True) in grants and (str(ws / ".venv"), "M", True) in grants and str(base) in note
     grants.clear()
     assert S._appc_project_venv(ws, st) == "" and grants == []          # 바뀐 것 없음 → 다시 안 함
+
+
+def test_prepared_workspace_relabels_executables_and_skips_nested_folders(tmp_path, monkeypatch):
+    """Low 레이블을 물려받은 실행 파일은 사용자가 직접 실행해도 Low 로 떠서 프로젝트 .venv 의 python 이 망가졌다(실사용)."""
+    from cap import appcontainer_exec as A
+    calls = []
+    monkeypatch.setattr(A, "grant", lambda *a, **k: calls.append(("grant",) + a) or (True, ""))
+    monkeypatch.setattr(A, "label", lambda path, level: calls.append(("label", path, level)) or (True, ""))
+    monkeypatch.setattr(A, "medium_exes", lambda path: calls.append(("medium", path)) or (True, ""))
+    state = {"sid": "S-1-15-2-1", "workspaces": []}
+    monkeypatch.setattr(S, "_appc_state", lambda: state)
+    monkeypatch.setattr(S, "_appc_save", lambda st: None)
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    ok, _ = S.appc_prepare(ws)
+    assert ok and ("medium", str(ws.resolve())) in calls and str(ws.resolve()) in state["exe_medium"]
+    calls.clear()
+    (ws / ".cap" / "base-1").mkdir(parents=True)
+    assert S.appc_prepare(ws / ".cap" / "base-1") == (True, "") and calls == []      # 안쪽 폴더는 다시 안 함
+    state["exe_medium"] = []                                                           # 수정 전에 준비된 폴더
+    S.appc_prepare(ws)
+    assert ("medium", str(ws.resolve())) in calls

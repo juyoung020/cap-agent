@@ -104,6 +104,44 @@ def shrink_old(msgs: list[dict]) -> list[dict]:
 _DATA_WRAP = re.compile(r"\A(<data source=\"[^\"]*\">\n)(.*)(\n</data>)\Z", re.S)
 
 
+_FAIL_LINE = re.compile(r"^(FAILED |ERROR |E\s+\S|Traceback|\S+\.\w+:\d+(:|\s|$))|\b\w*(Error|Exception)\b")
+
+
+def failure_digest(body: str, max_lines: int = 15, max_chars: int = 900) -> str:
+    """테스트·명령 출력에서 무엇이 왜 실패했는지 보여 주는 줄만(FAILED·E 줄·파일:줄·오류 이름).
+    실사용에서 이 줄을 버리자 모델이 무엇이 실패했는지 잊고 같은 파일만 다시 읽다 턴 한도에 닿았다."""
+    keep, used = [], 0
+    for ln in body.splitlines():
+        s = ln.rstrip()
+        if not s or not _FAIL_LINE.search(s.lstrip()):
+            continue
+        s = s[:200]
+        if used + len(s) > max_chars or len(keep) >= max_lines:
+            break
+        keep.append(s)
+        used += len(s) + 1
+    return "\n".join(keep)
+
+
+_DEF_LINE = re.compile(r"^\s*(\d+)\|\s*(?:async\s+def|def|class|function|fn|func|pub\s+fn|struct|interface)\s+([A-Za-z_]\w*)")
+
+
+def read_outline(body: str, limit: int = 300) -> str:
+    """줄인 read_file 결과에 남길 지도: 그 범위에 정의된 함수·클래스와 줄 번호(look@115, Engagement@85).
+    실사용에서 압축으로 읽은 내용이 지워지자 모델이 무엇이 어디 있었는지 잊고 엉뚱한 파일에서 찾다 추측으로 답했다."""
+    out, used = [], 0
+    for ln in body.splitlines():
+        m = _DEF_LINE.match(ln)
+        if m:
+            item = f"{m.group(2)}@{m.group(1)}"
+            if used + len(item) > limit:
+                out.append("…")
+                break
+            out.append(item)
+            used += len(item) + 2
+    return ", ".join(out)
+
+
 def _prune_one(name: str, args: dict, body: str) -> str:
     """이번 턴의 오래된 도구 출력 하나를 한 줄로(실패 출력은 앞부분만)."""
     first = body.split("\n", 1)[0]
@@ -113,18 +151,37 @@ def _prune_one(name: str, args: dict, body: str) -> str:
         m = re.match(r"\[(.+?) 줄 (\d+)-(\d+) / 전체 (\d+)\]", first)
         where = (f"{m.group(1)} lines {m.group(2)}-{m.group(3)} of {m.group(4)}" if m
                  else str(args.get("path", "")))
-        return f"[pruned] read_file {where} ({len(body)} chars) — content removed to save context; read it again if needed."
+        defs = read_outline(body)
+        return (f"[pruned] read_file {where} ({len(body)} chars) — content removed to save context"
+                + (f"; it defines: {defs}" if defs else "") + ". Read only the part you need again if needed.")
     if name in ("run", "run_tests"):
         m = re.match(r"\[(?:(.*) → )?exit (-?\d+)\]", first)
         cmd = (m.group(1) if m and m.group(1) else "") or str(args.get("cmd") or args.get("target") or name)
         code = m.group(2) if m else "?"
-        return f"[pruned] {name} `{cmd[:200]}` → exit {code} ({len(body)} chars); last line: {last}"
+        head = f"[pruned] {name} `{cmd[:200]}` → exit {code} ({len(body)} chars); last line: {last}"
+        digest = failure_digest(body)
+        return head + ("\nkept failure lines:\n" + digest if digest else "")
     if name == "search":
         return (f"[pruned] search `{str(args.get('pattern', ''))[:120]}` in {args.get('path') or '.'} → "
                 f"{len(lines)} matching lines (output removed; search again if needed)")
     if name in ("edit_file", "write_file", "apply_patch") and (body.startswith("편집 적용") or re.match(r"\S+ 저장\(\d+자\)", body)):
         return f"[pruned] {name} {args.get('path', '')}: applied — {first[:120]}"
     return body[:PRUNE_FAIL_KEEP] + f"\n…[pruned {len(body) - PRUNE_FAIL_KEEP} more chars to save context]"
+
+
+def _is_test_call(tc: dict | None) -> bool:
+    if not tc:
+        return False
+    name = tc.get("function", {}).get("name", "")
+    if name == "run_tests":
+        return True
+    if name != "run":
+        return False
+    try:
+        cmd = str(json.loads(tc["function"].get("arguments") or "{}").get("cmd", ""))
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    return bool(re.search(r"\b(pytest|unittest|npm (run )?test|cargo test|go test|make test)\b", cmd))
 
 
 def prune_turn(msgs: list[dict], start: int, keep_rounds: int = 2) -> list[dict]:
@@ -137,10 +194,15 @@ def prune_turn(msgs: list[dict], start: int, keep_rounds: int = 2) -> list[dict]
     stop = rounds[-keep_rounds] if keep_rounds > 0 else len(msgs)
     out = list(msgs)
     calls: dict[str, dict] = {}
+    for i in range(rounds[0], len(msgs)):
+        if msgs[i].get("role") == "assistant":
+            calls.update({tc["id"]: tc for tc in msgs[i].get("tool_calls") or []})
+    # 이번 턴의 가장 최근 테스트 결과는 줄이지 않는다(무엇이 실패했는지가 다음 행동의 근거)
+    latest_test = max((i for i in range(rounds[0], len(msgs)) if msgs[i].get("role") == "tool"
+                       and _is_test_call(calls.get(msgs[i].get("tool_call_id")))), default=-1)
     for i in range(rounds[0], stop):
         m = msgs[i]
-        if m.get("role") == "assistant":
-            calls.update({tc["id"]: tc for tc in m.get("tool_calls") or []})
+        if m.get("role") == "assistant" or i == latest_test:
             continue
         c = m.get("content")
         if m.get("role") != "tool" or not isinstance(c, str) or len(c) <= PRUNE_OVER:

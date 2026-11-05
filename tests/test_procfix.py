@@ -123,17 +123,22 @@ def _wait_exit(ws, pid, s=20):
         time.sleep(0.05)
 
 
+def _body(out: str) -> str:
+    """bg_output_new 의 출력에서 머리 줄(명령 앞 80자가 들어 있다)을 뺀 부분."""
+    return out.split("\n", 1)[1] if "\n" in out else ""
+
+
 def test_model_output_returns_only_new_output(tmp_path):
     code = "import time; print('first-line', flush=True); time.sleep(1.5); print('second-line', flush=True); time.sleep(5)"
     pid = ext.bg_start(tmp_path, f'"{sys.executable}" -u -c "{code}"')
     try:
         ok, one = ext.bg_output_new(tmp_path, pid, wait=15)
-        assert ok and "first-line" in one and "running" in one and "new chars" in one and "total" in one
-        if "second-line" not in one:
+        assert ok and "first-line" in _body(one) and "running" in one and "new chars" in one and "total" in one
+        if "second-line" not in _body(one):
             ok, two = ext.bg_output_new(tmp_path, pid, wait=15)
-            assert "second-line" in two and "first-line" not in two
+            assert "second-line" in _body(two) and "first-line" not in _body(two)
         ok, three = ext.bg_output_new(tmp_path, pid, wait=0)
-        assert "first-line" not in three and "(no new output)" in three
+        assert "first-line" not in _body(three) and "(no new output)" in three
         assert "first-line" in ext.bg_output(tmp_path, pid)[1]           # 사람용·직접 호출은 꼬리 그대로
     finally:
         ext.bg_kill_all(tmp_path)
@@ -145,9 +150,9 @@ def test_model_output_on_exited_process_returns_at_once(tmp_path):
         _wait_exit(tmp_path, pid)
         t0 = time.monotonic()
         ok, out = ext.bg_output_new(tmp_path, pid, wait=2)
-        assert ok and "123" in out and "exited 0" in out
+        assert ok and "123" in _body(out) and "exited 0" in out
         ok, again = ext.bg_output_new(tmp_path, pid, wait=2)
-        assert "123" not in again and time.monotonic() - t0 < 1.5
+        assert "123" not in _body(again) and time.monotonic() - t0 < 1.5
         assert ext.bg_output_new(tmp_path, "bg99")[0] is False
     finally:
         ext.bg_kill_all(tmp_path)
@@ -179,7 +184,7 @@ def test_long_run_moves_to_background(tmp_path, monkeypatch):
         _wait_exit(tmp_path, pid)
         ok, out = ext.bg_output_new(tmp_path, pid, wait=5)
         assert "exited 0" in out
-        assert ("serving" in res["output"]) != ("serving" in out)       # 보여 준 부분 출력은 다시 보내지 않는다
+        assert ("serving" in res["output"]) != ("serving" in _body(out))   # 보여 준 부분 출력은 다시 보내지 않는다
     finally:
         ext.bg_kill_all(tmp_path)
 

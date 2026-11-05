@@ -266,6 +266,10 @@ def ensure_cap(ws: Path) -> None:
 
 def detect_test_cmd(ws: Path) -> str:
     """Hermes 07 §2-3 detect_project_facts 의 축소판: pytest(테스트 파일·pytest.ini·[tool.pytest]) → npm test."""
+    from .trust import project_setting
+    chosen = project_setting(ws, "test_cmd")              # /testcmd 로 사용자가 정한 것이 먼저
+    if chosen:
+        return chosen
     pyproject = ws / "pyproject.toml"
     if collect_test_files(ws) or (ws / "pytest.ini").is_file() or \
             (pyproject.is_file() and "[tool.pytest" in pyproject.read_text(encoding="utf-8", errors="ignore")):
@@ -1150,6 +1154,7 @@ SLASH_COMMANDS = [   # (명령, 인자 설명, 한 줄 설명) — /help 와 TUI
     ("/clear", "", "start a new conversation"),
     ("/resume", "[n|id]", "list or reopen past sessions"),
     ("/continue", "", "continue a turn that stopped midway (crash, error, Esc) from its last checkpoint"),
+    ("/testcmd", "[command|reset]", "show or set the test command CAP uses to verify changes in this project"),
     ("/spec", "<task>", "optional: draft and lock a spec"),
     ("/graph", "[change]", "optional: build or change the plan graph"),
     ("/run", "", "optional: run the plan graph"),
@@ -1159,7 +1164,7 @@ SLASH_COMMANDS = [   # (명령, 인자 설명, 한 줄 설명) — /help 와 TUI
 
 def config_lines(s: "ChatSession", ws: Path) -> list[str]:
     """/config: 지금 적용되는 설정을 한눈에(무엇이 어디서 왔는지)."""
-    from . import compat, sandbox
+    from . import autoreview, compat, sandbox
     from .memory import find_skills, user_home
     rules = s.rules
     hooks_n = sum(len(v) for v in s.hooks.by_event.values())
@@ -1178,6 +1183,7 @@ def config_lines(s: "ChatSession", ws: Path) -> list[str]:
         f"rules         allow {len(rules.get('allow', []))} · deny {len(rules.get('deny', []))}"
         + (f" · {len(rules['untrusted_allow'])} project allow rules not trusted (/permissions trust)"
            if rules.get("untrusted_allow") else ""),
+        f"auto review   {autoreview.describe()}",
         f"hooks         {hooks_n}" + (" · project hooks not trusted (/hooks trust)" if s.hooks.untrusted else ""),
         f"mcp           on: {', '.join(mcp_on) or 'none'} · available but off: "
         f"{len([n for n in s.mcp.foreign if n not in s.mcp.configs])} (/mcp)",
@@ -1463,6 +1469,16 @@ def handle_command(s: ChatSession, ws: Path, line: str) -> tuple[ChatSession, bo
             s.close()
             s = ChatSession(ws, None, mode, ui)
             ui.out(f"New conversation: session {s.sid} (/resume to reopen older ones)")
+        elif cmd == "/testcmd":
+            from .trust import set_project_setting
+            if rest == "reset":
+                set_project_setting(ws, "test_cmd", "")
+            elif rest:
+                set_project_setting(ws, "test_cmd", rest)
+            ui.out(f"test command for this project: {detect_test_cmd(ws) or '(none found)'}"
+                   + ("" if rest else "  — set: /testcmd <command>, back to auto: /testcmd reset"))
+            if rest:
+                ui.out("It is used from the next request (the harness runs it to verify changes).")
         elif cmd == "/continue":
             if s.pending() or s.stopped_midway():
                 return s, False, CONTINUE
@@ -1731,9 +1747,14 @@ def repl(ws: Path, approval: str = "ask", resume: str | None = None) -> int:
         if s.pending():
             ui.out(ui.yellow("Resuming a pending approval from last time."))
             _turn(s, None)
+    from . import updates
+    updates.start()                    # 새 버전 확인(하루 한 번, 백그라운드) — 알림은 다음 입력 줄 앞에
     ui.out("")
     try:
         while True:
+            note = updates.take()
+            if note:
+                ui.out(ui.yellow(note))
             try:
                 line = _read_line(ui.bold("> ")).strip()
             except EOFError:

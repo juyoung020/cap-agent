@@ -24,10 +24,14 @@ def test_wrap_builds_the_right_launchers(tmp_path):
     args, _ = sbx.wrap("echo hi", tmp_path, "landlock")
     assert args[1].endswith("landlock_exec.py") and "--no-net" in args and args[-3:] == ["bash", "-c", "echo hi"]
     assert str(tmp_path.resolve()) in args
+    assert sbx.wrap("echo hi", tmp_path, "seatbelt")[0] is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the wsl backend runs WSL from Windows (drive paths)")
+def test_wrap_builds_the_wsl_launcher():
     args, _ = sbx.wrap("echo hi", Path("C:/Users/a b/ws"), "wsl", timeout=9)
     assert args[:3] == ["wsl.exe", "--cd", "/mnt/c/Users/a b/ws"] and ["timeout", "-k", "5", "9"] == args[-7:-3]
     assert args[-1].endswith("echo hi") and "wsl-venv/bin" in args[-1]
-    assert sbx.wrap("echo hi", tmp_path, "seatbelt")[0] is None
     assert sbx.to_wsl(Path("D:/x/y z")) == "/mnt/d/x/y z"
 
 

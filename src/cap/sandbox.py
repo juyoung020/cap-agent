@@ -141,8 +141,16 @@ def appc_prepare(ws: Path) -> tuple[bool, str]:
     """이 작업 폴더에 격리의 읽기·쓰기 권한과 Low 무결성 레이블을 준다(폴더마다 한 번). 기록은 ~/.cap/sandbox.json."""
     st = _appc_state()
     key = str(ws.resolve())
+    for w in st.get("workspaces", []):           # 이미 준비된 폴더 안(예: 기준선 사본 .cap/base-*)은 권한을 물려받는다
+        if key != w and key.lower().startswith(w.lower().rstrip("\\/") + os.sep):
+            return True, ""
     venv_note = _appc_project_venv(ws, st)
     if key in st.get("workspaces", []):
+        if key not in st.setdefault("exe_medium", []):    # 이 수정 전에 준비된 폴더: 실행 파일 레이블을 한 번 되돌린다
+            from . import appcontainer_exec as A
+            A.medium_exes(key)
+            st["exe_medium"].append(key)
+            _appc_save(st)
         return True, venv_note
     st["workspaces"] = [w for w in st.get("workspaces", []) if Path(w).is_dir()]   # 지워진 폴더(실험 임시 폴더 등)는 뺀다
     from . import appcontainer_exec as A
@@ -151,6 +159,8 @@ def appc_prepare(ws: Path) -> tuple[bool, str]:
         ok, out = A.label(key, "low")
     if not ok:
         return False, out[:300]
+    A.medium_exes(key)          # 실행 파일은 Medium 으로(사용자가 직접 실행할 때 Low 로 뜨지 않게)
+    st.setdefault("exe_medium", []).append(key)
     st.setdefault("workspaces", []).append(key)
     _appc_save(st)
     return True, f"[sandbox] gave the Windows sandbox read+write access to {key} (undo: /sandbox undo)"
@@ -186,9 +196,11 @@ def _appc_project_venv(ws: Path, st: dict) -> str:
                 changed = True
                 notes.append(f"read access to the project venv's Python ({home})")
         site = next((p for p in (venv / "Lib" / "site-packages", venv / "lib") if p.is_dir()), venv)
-        stamp = str(site.stat().st_mtime_ns)
+        scripts = next((p for p in (venv / "Scripts", venv / "bin") if p.is_dir()), venv)
+        stamp = f"{site.stat().st_mtime_ns}:{scripts.stat().st_mtime_ns}"
         if st.setdefault("venvs", {}).get(str(venv)) != stamp:
             ok, _ = A.grant(str(venv), st["sid"], "M", every_file=True)
+            A.medium_exes(str(venv))    # 새로 깔린 실행 파일도 Medium 으로
             if ok:
                 st["venvs"][str(venv)] = stamp
                 changed = True

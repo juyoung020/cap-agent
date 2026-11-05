@@ -699,6 +699,8 @@ class CapApp(App):
             self._refresh_status()
             self.set_interval(10, self._refresh_status)
         self.query_one(Composer).focus()
+        from . import updates                                  # 새 버전 확인(하루 한 번, 백그라운드 스레드)
+        updates.start(lambda line: self.post(self.add_cell, Text(line, style=P["warning"])))
         # 다시 연 세션: 승인 대기면 바로 이어 묻고, 중간에 멈춘 턴이면 알린다
         if self.resumed and self.s.pending():
             self.add_cell(Text("Resuming a pending approval from last time.", style=P["muted"]))

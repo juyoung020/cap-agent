@@ -20,9 +20,12 @@ from ctypes import wintypes as wt
 PROFILE = "cap.sandbox"
 DISPLAY = "CAP command sandbox"
 
-k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-userenv = ctypes.WinDLL("userenv", use_last_error=True)
-advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+if os.name == "nt":
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    userenv = ctypes.WinDLL("userenv", use_last_error=True)
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+else:                   # 다른 OS 에서는 불러오기만 된다(판정·배선 시험용). 격리 실행은 Windows 에서만
+    k32 = userenv = advapi = None
 
 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x00020009
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
@@ -110,6 +113,15 @@ def label(path: str, level: str) -> tuple[bool, str]:
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def medium_exes(path: str) -> tuple[bool, str]:
+    """폴더 아래 실행 파일(*.exe)은 Medium 레이블로. Low 레이블을 물려받은 실행 파일은 사용자가 직접 실행해도
+    Low 프로세스로 떠서(예: 프로젝트 .venv 의 python.exe 가 기본 파이썬을 못 열어 'permission denied') 망가진다.
+    격리 안에서는 그대로 실행된다(Low 가 Medium 파일을 실행하면 Low 로 뜸). 고치지는 못한다."""
+    r = subprocess.run(["icacls", os.path.join(path, "*.exe"), "/setintegritylevel", "medium", "/T", "/C", "/Q"],
+                       capture_output=True, text=True, encoding="mbcs", errors="replace")
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 def revoke(path: str, sid: str) -> tuple[bool, str]:
     r = subprocess.run(["icacls", path, "/remove:g", f"*{sid}", "/Q"], capture_output=True, text=True,
                        encoding="mbcs", errors="replace")
@@ -133,17 +145,26 @@ _os.mkdir = _cap_mkdir
 
 
 def sandbox_env(base: dict, sbx: str) -> dict:
-    """격리 안의 환경: 임시·홈 폴더는 작업 폴더 안(.cap/sbx), 파이썬 보정, 네트워크 도구는 오프라인 설정."""
+    """격리 안의 환경: 임시·홈 폴더는 작업 폴더 안(.cap/sbx), 파이썬 보정, 네트워크 도구는 오프라인 설정,
+    PATH 앞에 유닉스 명령(ls·cat·grep …, winutils.py)을 둔 .cap/sbx/bin."""
     from pathlib import Path as _P
+    try:
+        from . import winutils
+    except ImportError:              # 이 파일을 스크립트로 돌릴 때(sandbox.wrap)
+        import winutils
     d = _P(sbx)
     for sub in ("tmp", "home", "site"):
         (d / sub).mkdir(parents=True, exist_ok=True)
     (d / "site" / "sitecustomize.py").write_text(SITECUSTOMIZE, encoding="utf-8")
+    py = getattr(sys, "_base_executable", "") or sys.executable     # venv 리디렉터를 건너뛴 진짜 파이썬(읽기·실행 허락됨)
+    bin_dir = winutils.install(str(d / "bin"), py if os.path.isfile(py) else sys.executable)
     env = dict(base)
     env.update(TMP=str(d / "tmp"), TEMP=str(d / "tmp"), HOME=str(d / "home"),
                PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", npm_config_offline="true",
                PYTHONDONTWRITEBYTECODE="1")
     env["PYTHONPATH"] = str(d / "site") + (";" + base["PYTHONPATH"] if base.get("PYTHONPATH") else "")
+    path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
+    env[path_key] = bin_dir + (";" + env[path_key] if env.get(path_key) else "")
     return env
 
 

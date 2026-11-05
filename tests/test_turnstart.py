@@ -217,7 +217,7 @@ def test_prune_turn_shortens_old_outputs_only():
     assert new[-4:] == msgs[-4:]                                                     # 마지막 2묶음 그대로
     read, run, edit, search = new[3]["content"], new[5]["content"], new[7]["content"], new[9]["content"]
     assert read.startswith("<data source=\"read_file\">\n[pruned] read_file a.py lines 1-119 of 119") and read.endswith("</data>")
-    assert "read it again" in read and len(read) < 300
+    assert "Read only the part you need again" in read and len(read) < 300
     assert "`python -m pytest -q` → exit 1" in run and "1 failed, 2 passed" in run and run.endswith("</data>")
     assert edit.startswith(msgs[7]["content"][:300]) and len(edit) < len(msgs[7]["content"])   # 실패는 앞부분 남김
     assert "search `line 1`" in search and "40 matching lines" in search

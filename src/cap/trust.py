@@ -76,6 +76,36 @@ def add_project_approval(ws: Path, category: str) -> bool:
     return True
 
 
+def _proj_store() -> Path:
+    from . import memory
+    return memory.user_home() / "project_settings.json"
+
+
+def project_setting(ws: Path, key: str) -> str:
+    """사용자가 이 프로젝트에 정한 값(예: 테스트 명령). 사용자 홈에 있어 저장소가 끼워 넣지 못한다."""
+    try:
+        v = json.loads(_proj_store().read_text(encoding="utf-8")).get(_key("project", ws), {}).get(key, "")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return ""
+    return v if isinstance(v, str) else ""
+
+
+def set_project_setting(ws: Path, key: str, value: str) -> None:
+    st = _proj_store()
+    try:
+        data = json.loads(st.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    cur = dict(data.get(_key("project", ws), {}))
+    if value:
+        cur[key] = value
+    else:
+        cur.pop(key, None)
+    data[_key("project", ws)] = cur
+    st.parent.mkdir(parents=True, exist_ok=True)
+    st.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
 def clear_project_approvals(ws: Path) -> int:
     st = _approvals_store()
     try:
