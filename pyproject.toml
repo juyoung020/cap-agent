@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cap-agent"
+version = "0.8.0"
+description = "CAP (Code As Planned) - a LangGraph coding agent: permission table, OS sandbox, test gate, any OpenAI-compatible model"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+dependencies = [
+  "langgraph>=1.0",
+  "langgraph-checkpoint-sqlite>=3.0",
+  "openai>=1.0",
+  "pyyaml",
+  "python-dotenv",
+  "textual>=1.0",
+  "pytest",
+]
+
+[project.scripts]
+cap = "cap.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+cap = ["snippets/*.md"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/juyoung020/cap-agent"
+Issues = "https://github.com/juyoung020/cap-agent/issues"

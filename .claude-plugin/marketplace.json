@@ -1,0 +1,16 @@
+{
+  "name": "cap",
+  "owner": {
+    "name": "juyoung020"
+  },
+  "metadata": {
+    "description": "CAP coding agent as a Claude Code plugin (MCP server run_task)."
+  },
+  "plugins": [
+    {
+      "name": "cap",
+      "source": "./",
+      "description": "Hand coding tasks to CAP through its MCP server (run_task)."
+    }
+  ]
+}

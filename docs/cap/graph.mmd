@@ -1,0 +1,44 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	context(context)
+	agent(agent)
+	validate(validate)
+	permission(permission)
+	approval(approval)
+	checkpoint(checkpoint)
+	tools(tools)
+	verify_gate(verify_gate)
+	escalate(escalate)
+	subagent(subagent)
+	sub_join(sub_join)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> context;
+	agent -.-> validate;
+	agent -.-> verify_gate;
+	approval -.-> agent;
+	approval -.-> checkpoint;
+	checkpoint --> tools;
+	context -.-> __end__;
+	context -.-> agent;
+	escalate -.-> __end__;
+	escalate -.-> agent;
+	permission -.-> agent;
+	permission -.-> approval;
+	permission -.-> checkpoint;
+	sub_join --> agent;
+	subagent --> sub_join;
+	tools -.-> agent;
+	tools -.-> escalate;
+	tools -.-> subagent;
+	validate --> permission;
+	verify_gate -.-> __end__;
+	verify_gate -.-> agent;
+	verify_gate -.-> escalate;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
