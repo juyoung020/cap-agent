@@ -163,9 +163,14 @@ def sandbox_env(base: dict, sbx: str) -> dict:
     d = _P(sbx)
     for sub in ("tmp", "home", "site"):
         (d / sub).mkdir(parents=True, exist_ok=True)
-    junk = d / "tmp" / "cap-devnull"                # NUL 대신 쓰는 파일(아래 sitecustomize·winutils)이 커지지 않게
-    if junk.is_file() and junk.stat().st_size > 1 << 20:
-        junk.unlink(missing_ok=True)
+    # NUL 대신 쓰는 파일(sitecustomize·winutils 의 %TEMP%\cap-devnull)이 커지지 않게. Windows 는 격리 안의 TEMP 를
+    # 격리 전용 폴더(%LOCALAPPDATA%\Packages\cap.sandbox\AC\Temp)로 바꿔 준다.
+    junk = _P(os.environ.get("LOCALAPPDATA", "")) / "Packages" / PROFILE / "AC" / "Temp" / "cap-devnull"
+    try:
+        if junk.is_file() and junk.stat().st_size > 1 << 20:
+            junk.unlink()
+    except OSError:
+        pass
     (d / "site" / "sitecustomize.py").write_text(SITECUSTOMIZE, encoding="utf-8")
     py = getattr(sys, "_base_executable", "") or sys.executable     # venv 리디렉터를 건너뛴 진짜 파이썬(읽기·실행 허락됨)
     bin_dir = winutils.install(str(d / "bin"), py if os.path.isfile(py) else sys.executable)

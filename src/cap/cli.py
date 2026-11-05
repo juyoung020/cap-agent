@@ -409,6 +409,44 @@ def _ready_or_setup(interactive: bool = True) -> bool:
     return False
 
 
+_VALUE_OPTS = ("--mode", "--approval", "-a", "--provider", "--model", "--profile", "--sandbox")
+_FLAG_OPTS = ("--full-auto", "--plain")
+
+
+def _hoist_exec_options(args: list[str]) -> list[str]:
+    """`cap exec --mode auto "할 일"` 처럼 exec 뒤에 쓴 공용 옵션을 앞으로 옮긴다(Codex `exec --full-auto` 습관).
+    할 일 문장(따옴표로 묶인 한 덩어리) 앞에 있는 옵션만 옮긴다."""
+    if "exec" not in args:
+        return args
+    k = args.index("exec")
+    if any(not a.startswith("-") for a in args[:k]):       # exec 가 할 일 문장 속 단어일 때
+        return args
+    head, tail, j = args[:k], [], k + 1
+    while j < len(args):
+        a = args[j]
+        if a in _VALUE_OPTS and j + 1 < len(args):
+            head += [a, args[j + 1]]
+            j += 2
+        elif a in _FLAG_OPTS or a.startswith(("--mode=", "--approval=")):
+            head.append(a)
+            j += 1
+        elif a == "resume" and "resume" not in tail:                  # exec resume [--last|세션] … "후속 지시"
+            tail.append(a)
+            if j + 1 < len(args) and (args[j + 1] in ("--last", "last") or re.match(r"^\d{8}-\d{6}$|^\d{1,2}$", args[j + 1])):
+                tail.append(args[j + 1])
+                j += 1
+            j += 1
+        elif a.startswith("-"):                             # exec 전용 옵션(--json·--max-turns N …)은 그대로
+            tail.append(a)
+            if a in ("--max-turns", "-o", "--output-last-message", "--schema") and j + 1 < len(args):
+                tail.append(args[j + 1])
+                j += 1
+            j += 1
+        else:
+            break
+    return head + ["exec"] + tail + args[j:]
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -417,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdin.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):
             pass
-    args = list(sys.argv[1:] if argv is None else argv)
+    args = _hoist_exec_options(list(sys.argv[1:] if argv is None else argv))
     if args and args[0] in ("--version", "-V"):
         from . import __version__
         _out(f"cap {__version__}")

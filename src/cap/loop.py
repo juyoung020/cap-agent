@@ -118,8 +118,8 @@ WIN_RUN_SCHEMA = {"type": "function", "function": {
                     "workspace, has no network, and other folders are invisible. Unix basics work here: "
                     "`ls cat head tail grep wc find rm cp mv mkdir -p touch pwd which`, `sed -n 'A,Bp' file`, "
                     "`diff -u a b`, pipes, `&&`, `> file`, `python ...`, `python -m pytest -q`, `git ...`. "
-                    "Bash-only syntax does not: no `$(...)`, `for` loops, `[[ ]]`, `$VAR` or heredocs (cmd uses "
-                    "%VAR%). Edit files with edit_file, not sed. "
+                    "`$VAR` becomes %VAR%. Bash-only syntax does not work: no `$(...)`, `for` loops, `[[ ]]` or "
+                    "heredocs. Edit files with edit_file, not sed. "
                     "Set background=true for servers or watchers. If something truly needs more, retry with "
                     "escalate=true (the user is asked)."),
     "parameters": {"type": "object", "properties": {

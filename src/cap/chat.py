@@ -1919,8 +1919,17 @@ def one_shot(ws: Path, task: str, approval: str = "ask", as_json: bool = False,
     s = ChatSession(ws, sid, approval, ui)
     ui.out(ui.dim(f"CAP · {llm.MODEL} · {ws} · mode {approval} · session {s.sid} (resume: cap --resume)"))
     ui.out(ui.bold("> ") + task)
+
+    def no_terminal(payload: dict) -> str:    # 스크립트·CI 에서 띄움: 답할 사람이 없으니 기다리지 않고 거절(JSON 모드·Codex exec 와 같음)
+        if payload.get("kind") == "question":
+            return ""
+        for c in payload.get("calls", []):
+            ui.out(ui.yellow(f"  ✗ declined (no terminal to ask) — {c.get('reason', '')}: ")
+                   + short_call(c["tool"], c["args"], ws))
+        ui.out(ui.dim("    run with --mode auto (or answer in a terminal) to allow such actions"))
+        return "n"
     try:
-        r = s.run_turn(task)
+        r = s.run_turn(task, ask=None if sys.stdin.isatty() else no_terminal)
         show_result(s, r)
         save_last(s.last_answer(r["values"]))
         return 0 if r["values"].get("status") == "done" else 1

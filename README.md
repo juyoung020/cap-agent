@@ -41,7 +41,7 @@ CAP reads Claude Code and Codex configuration in place: skills (`.claude/skills`
 | Guard | What it does |
 |---|---|
 | Permission table | Every tool call is classified allow / ask / deny before it runs. Writing outside the workspace, reading secret files and destructive commands are refused in every mode. Agent instructions, existing tests and installs always need a human. |
-| Sandbox | Commands the model runs are isolated by the OS. **Windows**: AppContainer — reads and writes only inside the workspace, no network; the shell is `cmd.exe` (Git Bash and PowerShell do not start inside an AppContainer) with common Unix commands added by CAP (`ls cat head tail grep wc find rm cp mv mkdir -p touch diff`); bash syntax such as `$(...)` or `for` loops is not available. **Linux**: Landlock — writes only in the workspace and `/tmp`, no TCP. Running something outside the sandbox always asks you. |
+| Sandbox | Commands the model runs are isolated by the OS. **Windows**: AppContainer — reads and writes only inside the workspace, no network; the shell is `cmd.exe` (Git Bash and PowerShell do not start inside an AppContainer) with common Unix commands added by CAP (`ls cat head tail grep wc find rm cp mv mkdir -p touch diff`); `$VAR` is translated, but bash syntax such as `$(...)` or `for` loops is not available. **Linux**: Landlock — writes only in the workspace and `/tmp`, no TCP. Running something outside the sandbox always asks you. |
 | Test gate | Before a turn ends, the harness runs the project's tests itself. A failing test sends the output back to the model; "done" with failing tests is not accepted. |
 | Checkpoints | Every graph step is checkpointed (SQLite). `/continue` resumes a turn that stopped midway (crash, error, Esc) from its last step; `/undo` and `/rewind` restore files from a shadow git snapshot. |
 | Secrets | Key-like values are masked in everything the model sees; secret files are never read. |
@@ -102,11 +102,11 @@ graph TD;
 
 ## Status
 
-- Measured on Windows 11 with `qwen3.5-9b` (16k context): on 11 multi-file tasks (bugs whose cause is in another module, a feature across 6 files, API changes with hidden call sites, an 826-line file, refactoring), CAP passed 8 and handed the other 3 to a human with no false "done"; a single model call without the agent loop passed 1 and returned broken code for the other 10 (one run each). Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
+- Measured on Windows 11 with `qwen3.5-9b` (16k context): on 11 multi-file tasks (bugs whose cause is in another module, a feature across 6 files, API changes with hidden call sites, an 826-line file, refactoring), CAP passed 17 of 22 over two runs and handed the rest to a human, with no false "done"; a single model call without the agent loop passed 1 of 11 and returned broken code for the other 10. Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
 - Also run on a copy of a real research repository (267 files, 53 tests); the problems found there were fixed.
 - Tests run on Windows and Linux (Python 3.11, 3.12) in GitHub Actions.
 - Other providers were tested against a fake OpenAI-compatible server, not with real keys.
-- 513 tests: `python -m pytest -q tests` (no API calls).
+- 515 tests: `python -m pytest -q tests` (no API calls).
 
 ## License
 

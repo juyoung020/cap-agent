@@ -202,6 +202,11 @@ def test_translate():
     assert t("python x.py > /dev/null 2>&1") == 'python x.py > "%TEMP%\\cap-devnull" 2>&1'   # NUL 을 못 여는 컴퓨터가 있다
     assert t("python x.py 2>/dev/null") == 'python x.py 2>"%TEMP%\\cap-devnull"'
     assert t("cat < /dev/null") == "cat < NUL" and t("echo /dev/null") == "echo /dev/null"
+    # $X → %X%, 같은 줄에서 정한 값은 그대로 넣는다(cmd 는 줄을 읽을 때 %X% 를 한 번에 편다), 작은따옴표 안은 그대로
+    assert t("echo $HOME ${USER}") == "echo %HOME% %USER%" and t("cd $PWD") == "cd %CD%"
+    assert t("export FOO=bar && echo $FOO") == 'set "FOO=bar" && echo bar'
+    assert t("export A=x B=$A/y && echo $B") == 'set "A=x" && set "B=x/y" && echo x/y'
+    assert t("echo '$HOME'") == 'echo "$HOME"' and t("echo $(pwd)") == "echo $(pwd)"
     assert t("grep -n 'def foo' x.py | head -5") == 'grep -n "def foo" x.py | head -5'
     assert t("python -c 'print(1)'") == 'python -c "print(1)"'
     assert t("python -c 'import os; print(1)' && ls") == 'python -c "import os; print(1)" && ls'
@@ -285,6 +290,8 @@ def test_real_appcontainer_unix_commands(tmp_path):
         assert code == 0 and out.strip() == "beta yes", out
         code, out = sh("export FOO=bar && python -c \"import os; print(os.environ['FOO'])\" > /dev/null && echo ok")
         assert code == 0 and out.strip() == "ok", out
+        code, out = sh('export NAME=x && cat $NAME.txt | grep -c a && echo $TEMP | grep -c Temp')
+        assert code == 0 and out.split() == ["3", "1"], out
         code, out = sh("head -n 1 x.txt; wc -l x.txt; pwd")
         assert code == 0 and out.split("\n")[:3] == ["alpha", "3 x.txt", str(ws.resolve())], out
     finally:

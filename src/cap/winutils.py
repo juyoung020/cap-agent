@@ -959,19 +959,40 @@ def _unquote(v: str) -> str:
     return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
 
 
-DEVNULL_OUT = '"%TEMP%\\cap-devnull"'      # 격리 안 TEMP = 작업 폴더/.cap/sbx/tmp (NUL 을 못 여는 컴퓨터가 있다)
+DEVNULL_OUT = '"%TEMP%\\cap-devnull"'      # 격리 안 TEMP = Windows 가 주는 격리 전용 임시 폴더 (NUL 을 못 여는 컴퓨터가 있다)
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_VAR_ALIAS = {"PWD": "CD"}
+
+
+def _var(m: re.Match, known: dict[str, str]) -> str:
+    """$X·${X} → 이 줄에서 앞서 정한 값, 아니면 %X% ($PWD → %CD%)."""
+    name = m.group(1) or m.group(2)
+    if name in known:
+        return known[name]
+    return f"%{_VAR_ALIAS.get(name, name)}%"
 
 
 def translate(line: str) -> str:
     """cmd.exe 에 넘기기 전에 흔한 bash 습관을 조심스럽게 옮긴다(따옴표 안은 건드리지 않음):
     mkdir -p a/b → cap-mkdir, dir → cap-dir, export X=Y / X=Y cmd → set "X=Y" &&, >/dev/null → 격리 임시 파일(</dev/null → <NUL),
-    '…' → "…"(안에 " 가 없을 때), "a; b" → "a & b". 나머지는 그대로."""
+    '…' → "…"(안에 " 가 없을 때), "a; b" → "a & b", $X·${X} → %X%(같은 줄에서 정한 값이면 그 값, $PWD → %CD%).
+    나머지는 그대로($(...)·for·if 같은 bash 문법은 옮기지 않는다)."""
     t = _lex(line)
+    known: dict[str, str] = {}            # 이 줄에서 앞서 정한 변수(cmd 는 %X% 를 줄을 읽을 때 한 번에 펴서 뒤에서 못 본다)
     for k, tok in enumerate(t):
         if tok[0] == "op" and tok[1] == ";":
             tok[1] = "&" if k and t[k - 1][0] == "ws" else " &"
         elif tok[0] == "word":
-            w = re.sub(r"^((?:[^'\"]*=)?)'([^'\"]*[^'\"\\])'$", r'\1"\2"', tok[1])
+            w = tok[1]
+            if "'" not in w and "$" in w:
+                # X=$Y… 는 같은 줄에서 정한 값만 넣는다(PATH=$PATH:x 같은 건 구분자가 달라 그대로 두어 실패가 보이게)
+                names = [m.group(1) or m.group(2) for m in _VAR.finditer(w)]
+                if not _ASSIGN.match(w) or all(n in known for n in names):
+                    w = _VAR.sub(lambda m: _var(m, known), w)
+            a = _ASSIGN.match(w)
+            if a and "$" not in w and "%" not in a.group(2):
+                known[a.group(1)] = _unquote(a.group(2))
+            w = re.sub(r"^((?:[^'\"]*=)?)'([^'\"]*[^'\"\\])'$", r'\1"\2"', w)
             prev = next((x[1] for x in reversed(t[:k]) if x[0] != "ws"), "")
             m = re.match(r"^(.*?)/dev/null$", w)
             if m and (m.group(1).endswith(">") or (not m.group(1) and prev.endswith(">"))):

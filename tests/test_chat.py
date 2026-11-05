@@ -1,6 +1,7 @@
 """일반 코딩 에이전트(대화형) 모드를 가짜 모델 대본으로 돌린다. API 호출 없음."""
 
 import builtins
+import sys
 import json
 
 import pytest
@@ -237,6 +238,7 @@ def test_main_dispatch(ws, monkeypatch):
 
 def test_one_shot_runs_once(ws, monkeypatch, capsys):
     script(monkeypatch, FIX)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)     # 터미널에서 답하는 사용자
     monkeypatch.setattr(builtins, "input", lambda prompt="": "y")
     assert C.one_shot(ws, "double 고쳐줘") == 0
     out = capsys.readouterr().out
@@ -252,6 +254,29 @@ def test_one_shot_without_answer_denies(ws, monkeypatch, capsys):
     monkeypatch.setattr(builtins, "input", eof)
     C.one_shot(ws, "double 고쳐줘")
     assert (ws / "m.py").read_text() == BUGGY       # 답할 사람이 없으면 거절(fail-closed)
+
+
+def test_one_shot_without_terminal_declines_without_waiting(ws, monkeypatch, capsys):
+    """스크립트·CI 에서 띄운 cap exec(터미널 없음): 표준 입력을 기다리지 않고 거절한다(새 사용자 시험에서 20분 멈춤)."""
+    script(monkeypatch, [FIX[1], {"content": "승인을 못 받아 못 고쳤습니다."}])
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+
+    def never(prompt=""):
+        raise AssertionError("must not read stdin")
+    monkeypatch.setattr(builtins, "input", never)
+    C.one_shot(ws, "double 고쳐줘")
+    out = capsys.readouterr().out
+    assert "declined (no terminal to ask)" in out and "--mode auto" in out
+    assert (ws / "m.py").read_text() == BUGGY
+
+
+def test_exec_accepts_global_options_after_exec():
+    from cap.cli import _hoist_exec_options as h
+    assert h(["exec", "--mode", "auto", "고쳐줘"]) == ["--mode", "auto", "exec", "고쳐줘"]
+    assert h(["exec", "--json", "--full-auto", "--max-turns", "3", "x"]) == ["--full-auto", "exec", "--json", "--max-turns", "3", "x"]
+    assert h(["exec", "resume", "--last", "--mode=auto", "go"]) == ["--mode=auto", "exec", "resume", "--last", "go"]
+    assert h(["exec", "고쳐줘", "--mode", "auto"]) == ["exec", "고쳐줘", "--mode", "auto"]     # 할 일 뒤는 그대로
+    assert h(["fix", "exec", "bug"]) == ["fix", "exec", "bug"]
 
 
 def test_project_instructions_loaded(ws, monkeypatch):
