@@ -3,7 +3,7 @@
 `cap` → 배너 → `>` 에 할 일을 쓰면 현재 폴더에서 바로 코딩 루프(LangGraph, loop.build_loop mode="chat")를 돈다.
 - 같은 세션의 다음 입력은 같은 thread 에 이어 붙는다(SQLite 체크포인터, `cap --resume`/`/resume` 로 재개).
 - 도구 호출마다 한 줄 진행 표시, 위험 행동은 그 자리에서 [y]/[a]/[n] 으로 묻고 Command(resume=…) 로 계속.
-- 작업 폴더의 AGENTS.md / CLAUDE.md / .cap/instructions.md 를 시스템 프롬프트에 넣는다.
+- 작업 폴더의 CAP.md / AGENTS.md / CLAUDE.md / .cap/instructions.md 를 시스템 프롬프트에 넣는다.
 - Ctrl+C 는 지금 턴만 멈춘다(상태는 체크포인트에 남고, 다음 입력에서 '사용자가 중단함' 표식을 붙여 이어 감).
 - `cap "할 일"` / `cap exec "할 일"` 은 같은 것을 한 번만 돌리고 끝낸다.
 모드 5개(대화·승인·플랜·오토·바이패스, policy.MODE_TABLE)는 `--mode` 로 고르고, TUI 에서는 Shift+Tab(Alt+M)으로 바꾼다.
@@ -33,9 +33,10 @@ from .policy import APPROVAL_HELP, BYPASS_WARNING, MODE_TABLE, classify_command,
 from .store import Ledger, Shadow, cap_dir, file_hash, iter_files, now_id, rel
 from .tools import run_shell, spill
 
-# Codex(AGENTS.md, AGENTS.override.md)·Claude Code(CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md)·CAP 의 지침 파일
+# Codex(AGENTS.md, AGENTS.override.md)·Claude Code(CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md)·CAP 의 지침 파일.
+# 같은 폴더에서는 뒤에 있는 것이 나중에 들어가 이긴다 — CAP 자기 지침(CAP.md, 개인용 CAP.local.md)이 마지막
 INSTRUCTION_FILES = ("AGENTS.override.md", "AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md",
-                     ".cap/instructions.md")
+                     ".cap/instructions.md", "CAP.md", "CAP.local.md")
 IMPORT_RX = re.compile(r"(?<![\w`@])@((?:~/|\.{1,2}/|/)?[\w.\-/]+\.[A-Za-z0-9]+)")
 INSTRUCTIONS_MAX = 4000      # Codex 12 §7 표: AGENTS.md 상한 4 KiB(9B·16k)
 RECURSION = 500              # 사용자 턴 하나에 도구 라운드(노드 5개) × 최대 30턴 + 검증
@@ -353,10 +354,11 @@ def load_instructions(ws: Path) -> tuple[list[str], str]:
     chain = [ws.resolve()]
     if root is not None and root != ws.resolve():
         chain = [d for d in reversed(ws.resolve().parents) if d == root or root in d.parents] + chain
-    from .compat import claude_home, codex_home, import_on
+    from .compat import cap_home, claude_home, codex_home, import_on
     user_files = ([("~/.codex/AGENTS.md", codex_home() / "AGENTS.md")] if import_on("codex") else []) + \
-        ([("~/.claude/CLAUDE.md", claude_home() / "CLAUDE.md")] if import_on("claude") else [])
-    for label, p in user_files:                  # 사용자 전역 지침(Codex·Claude Code) — 프로젝트 지침보다 먼저
+        ([("~/.claude/CLAUDE.md", claude_home() / "CLAUDE.md")] if import_on("claude") else []) + \
+        [("~/.cap/CAP.md", cap_home() / "CAP.md")]
+    for label, p in user_files:                  # 사용자 전역 지침(Codex·Claude Code·CAP) — 프로젝트 지침보다 먼저
         if p.is_file():
             t = expand_imports(p.read_text(encoding="utf-8", errors="replace").strip(), p.parent, ws)
             if t:
@@ -970,7 +972,7 @@ def banner_rows(s: ChatSession) -> list[tuple[str, str]]:
             ("folder", str(s.ws)),
             ("mode", f"{mode_label(s.approval['mode'])} — {APPROVAL_HELP[s.approval['mode']]}"),
             ("tests", s.test_cmd or "(not found — verify gate off)"),
-            ("instructions", ", ".join(s.inst_names) or "(none: AGENTS.md / CLAUDE.md / .cap/instructions.md)")]
+            ("instructions", ", ".join(s.inst_names) or "(none: CAP.md / AGENTS.md / CLAUDE.md / .cap/instructions.md)")]
 
 
 def banner(s: ChatSession, resumed: bool = False) -> None:

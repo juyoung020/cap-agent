@@ -57,7 +57,7 @@ SECRET_RX = re.compile(r"(^|[\s/\\'\"=<>|;&(])(\.env(\.[\w.-]+)?|id_rsa\w*|id_ed
                        r"credentials\.json|\.netrc|\.pypirc)(?=$|[\s'\";|&)<>])", re.I)
 SECRET_OK = re.compile(r"\.env\.(example|sample|template|dist)$", re.I)
 # 지침 파일: 미래의 에이전트 행동을 조종하는 파일이라 인젝션이 눌러앉는 통로 → 항상 사람(Hermes 07 §5-3)
-INSTRUCTION_NAMES = {"agents.md", "agents.override.md", "claude.md", "claude.local.md", "soul.md", ".cursorrules",
+INSTRUCTION_NAMES = {"cap.md", "cap.local.md", "agents.md", "agents.override.md", "claude.md", "claude.local.md", "soul.md", ".cursorrules",
                      "gemini.md", ".clinerules", ".mcp.json"}
 # 다른 에이전트의 설정 폴더: 스킬·명령·하위 에이전트·훅·MCP 가 들어 있어 다음 세션의 행동을 바꾼다 → 쓰기는 늘 사람
 AGENT_CONFIG_DIRS = {".claude", ".codex", ".agents", ".claude-plugin", ".codex-plugin", ".cap-plugin"}

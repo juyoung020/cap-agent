@@ -34,6 +34,8 @@ Type a task: "fix the failing test in calc.py", "add a --verbose flag". CAP plan
 - **Scripts and CI**: `cap exec "task"`, `--json` (one result line), `--events` (JSONL progress, like `codex exec --json`), `--schema file.json`, `--max-turns N`, `-o last.txt`, `cap exec resume last "follow-up"`.
 - **From another agent**: `cap mcp-server` exposes a `run_task` MCP tool. The repository is also a Claude Code / Codex plugin.
 
+Project instructions go in `CAP.md`, read like Claude Code's `CLAUDE.md`: `CAP.md` (shared), `CAP.local.md` (personal, keep it out of git), `~/.cap/CAP.md` (all projects), and `CAP.md` in subfolders when CAP first touches files there. `AGENTS.md` and `CLAUDE.md` are read too; CAP's own file comes last and wins.
+
 CAP reads Claude Code and Codex configuration in place: skills (`.claude/skills`, `~/.codex/skills`), commands, sub-agents, hooks (including `hookSpecificOutput` decisions), MCP servers (tools, resources, prompts) and plugins. Foreign hooks and MCP servers stay off until you enable them, and project-level ones need `/hooks trust` / `/mcp trust`.
 
 ## Safety
@@ -106,7 +108,7 @@ graph TD;
 - Also run on a copy of a real research repository (267 files, 53 tests); the problems found there were fixed.
 - Tests run on Windows and Linux (Python 3.11, 3.12) in GitHub Actions.
 - Other providers were tested against a fake OpenAI-compatible server, not with real keys.
-- 515 tests: `python -m pytest -q tests` (no API calls).
+- 517 tests: `python -m pytest -q tests` (no API calls).
 
 ## License
 

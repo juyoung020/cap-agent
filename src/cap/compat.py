@@ -4,7 +4,7 @@
 
 | 무엇 | CAP | Claude Code | Codex |
 |---|---|---|---|
-| 지침 | AGENTS.md · CLAUDE.md · .cap/instructions.md | CLAUDE.md | AGENTS.md |
+| 지침 | CAP.md · CAP.local.md · ~/.cap/CAP.md · AGENTS.md · CLAUDE.md · .cap/instructions.md | CLAUDE.md | AGENTS.md |
 | 스킬 | .cap/skills, ~/.cap/skills | .claude/skills, ~/.claude/skills | .agents/skills, .codex/skills, ~/.codex/skills |
 | 명령 | .cap/commands, ~/.cap/commands | .claude/commands, ~/.claude/commands | ~/.codex/prompts |
 | 하위 에이전트 | .cap/agents, ~/.cap/agents | .claude/agents, ~/.claude/agents | — |

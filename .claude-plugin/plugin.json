@@ -1,6 +1,6 @@
 {
   "name": "cap",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "description": "CAP (Code As Planned): a LangGraph coding agent for small models. Adds an MCP tool `run_task` that hands a coding task to CAP (permission table, sandbox, test gate) and returns a JSON result.",
   "author": {
     "name": "juyoung020"

@@ -332,12 +332,12 @@ def guard_check_after(hist: list) -> tuple[str, str]:
     return "", ""
 
 
-SUB_INSTRUCTION_NAMES = ("AGENTS.md", "CLAUDE.md")
+SUB_INSTRUCTION_NAMES = ("AGENTS.md", "CLAUDE.md", "CAP.md")
 SUB_INSTRUCTIONS_MAX = 3000
 
 
 def nested_instructions(ws: Path, path: str, loaded: list[str]) -> tuple[str, list[str]]:
-    """작업 폴더 아래 하위 폴더의 AGENTS.md·CLAUDE.md 중 아직 안 읽어 준 것 → 도구 결과 뒤에 붙일 글.
+    """작업 폴더 아래 하위 폴더의 AGENTS.md·CLAUDE.md·CAP.md 중 아직 안 읽어 준 것 → 도구 결과 뒤에 붙일 글.
     루트의 지침 파일은 시스템 프롬프트에 이미 있다."""
     try:
         target = (ws / path).resolve() if not Path(path).is_absolute() else Path(path).resolve()
