@@ -199,8 +199,9 @@ def test_translate():
     assert t("export FOO=bar && python x.py") == 'set "FOO=bar" && python x.py'
     assert t("export A=1 B='x y'") == 'set "A=1" && set "B=x y"'
     assert t("PYTHONPATH=src python -m pytest -q") == 'set "PYTHONPATH=src" && python -m pytest -q'
-    assert t("python x.py > /dev/null 2>&1") == "python x.py > NUL 2>&1"
-    assert t("python x.py 2>/dev/null") == "python x.py 2>NUL"
+    assert t("python x.py > /dev/null 2>&1") == 'python x.py > "%TEMP%\\cap-devnull" 2>&1'   # NUL 을 못 여는 컴퓨터가 있다
+    assert t("python x.py 2>/dev/null") == 'python x.py 2>"%TEMP%\\cap-devnull"'
+    assert t("cat < /dev/null") == "cat < NUL" and t("echo /dev/null") == "echo /dev/null"
     assert t("grep -n 'def foo' x.py | head -5") == 'grep -n "def foo" x.py | head -5'
     assert t("python -c 'print(1)'") == 'python -c "print(1)"'
     assert t("python -c 'import os; print(1)' && ls") == 'python -c "import os; print(1)" && ls'

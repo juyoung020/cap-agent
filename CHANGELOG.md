@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-06
+
+### Fixed
+- On some Windows machines (GitHub Actions runners) every sandboxed command failed with `Access is denied`: processes inside the AppContainer could not open the NUL device. `chcp` output, `> /dev/null` and Python's `os.devnull` inside the sandbox now go to a file in the sandbox temp folder, and a failing `chcp` no longer stops the command.
+- `/resume` picking the older of two sessions opened in the same second.
+- Linux: a Windows-only labelling helper called `icacls`; a string escape warning in `sandbox.py`.
+
 ## [0.10.0] - 2026-11-05
 
 ### Added
@@ -43,7 +50,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - LangGraph coding loop with permission table, approvals, checkpoints (`/continue`), test gate, sub-agents.
 - Claude Code / Codex compatibility: skills, commands, sub-agents, hooks, MCP (tools, resources, prompts), plugins.
 
-[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/juyoung020/cap-agent/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/juyoung020/cap-agent/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/juyoung020/cap-agent/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/juyoung020/cap-agent/releases/tag/v0.8.0

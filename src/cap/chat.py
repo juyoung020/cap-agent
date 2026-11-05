@@ -409,7 +409,7 @@ def list_sessions(ws: Path) -> list[dict]:
             out.append(json.loads(p.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             pass
-    return sorted(out, key=lambda m: m.get("updated") or m.get("started") or "")
+    return sorted(out, key=lambda m: (m.get("updated") or m.get("started") or "", m.get("sid") or ""))   # 같은 초면 나중에 연 세션이 뒤
 
 
 class ChatSession:

@@ -117,6 +117,8 @@ def medium_exes(path: str) -> tuple[bool, str]:
     """폴더 아래 실행 파일(*.exe)은 Medium 레이블로. Low 레이블을 물려받은 실행 파일은 사용자가 직접 실행해도
     Low 프로세스로 떠서(예: 프로젝트 .venv 의 python.exe 가 기본 파이썬을 못 열어 'permission denied') 망가진다.
     격리 안에서는 그대로 실행된다(Low 가 Medium 파일을 실행하면 Low 로 뜸). 고치지는 못한다."""
+    if os.name != "nt":
+        return True, ""
     r = subprocess.run(["icacls", os.path.join(path, "*.exe"), "/setintegritylevel", "medium", "/T", "/C", "/Q"],
                        capture_output=True, text=True, encoding="mbcs", errors="replace")
     return r.returncode == 0, (r.stdout + r.stderr).strip()
@@ -141,6 +143,12 @@ _mkdir = _os.mkdir
 def _cap_mkdir(path, mode=0o777, *a, **k):
     return _mkdir(path, 0o777 if mode == 0o700 else mode, *a, **k)
 _os.mkdir = _cap_mkdir
+# 어떤 컴퓨터(GitHub Actions 의 Windows 등)는 격리 안에서 NUL 장치를 열지 못한다(pytest 가 시작할 때 연다).
+# 그럴 때 os.devnull 을 임시 폴더의 파일로 바꾼다(subprocess.DEVNULL 도 이것을 쓴다).
+try:
+    open(_os.devnull, "rb").close()
+except OSError:
+    _os.devnull = _os.path.join(_os.environ.get("TEMP") or ".", "cap-devnull")
 """
 
 
@@ -155,6 +163,9 @@ def sandbox_env(base: dict, sbx: str) -> dict:
     d = _P(sbx)
     for sub in ("tmp", "home", "site"):
         (d / sub).mkdir(parents=True, exist_ok=True)
+    junk = d / "tmp" / "cap-devnull"                # NUL 대신 쓰는 파일(아래 sitecustomize·winutils)이 커지지 않게
+    if junk.is_file() and junk.stat().st_size > 1 << 20:
+        junk.unlink(missing_ok=True)
     (d / "site" / "sitecustomize.py").write_text(SITECUSTOMIZE, encoding="utf-8")
     py = getattr(sys, "_base_executable", "") or sys.executable     # venv 리디렉터를 건너뛴 진짜 파이썬(읽기·실행 허락됨)
     bin_dir = winutils.install(str(d / "bin"), py if os.path.isfile(py) else sys.executable)

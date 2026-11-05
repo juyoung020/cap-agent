@@ -602,7 +602,8 @@ def shell_args(cmd: str, cwd: Path, sandbox: str = "", timeout: int | None = Non
         inner = cmd
         if sandbox == "appcontainer":          # Windows 격리: cmd.exe, venv 파이썬이 먼저 잡히게
             from .winutils import translate    # mkdir -p·dir·export·/dev/null 같은 bash 습관을 cmd 로(유닉스 명령은 .cap/sbx/bin)
-            inner = f'chcp 65001 >nul && set "PATH={first};%PATH%{";" + last if last else ""}" && {translate(cmd)}'
+            # chcp 결과는 NUL 대신 격리 임시 폴더의 파일로(NUL 을 못 여는 컴퓨터가 있다), 실패해도 명령은 돈다
+            inner = f'chcp 65001 >"%TEMP%\\cap-devnull" 2>&1 & set "PATH={first};%PATH%{";" + last if last else ""}" && {translate(cmd)}'
         elif sandbox != "wsl" and bash:          # 리눅스: venv 파이썬이 먼저 잡히게(WSL 은 리눅스 쪽 도구를 쓴다)
             inner = f'export PATH="{_bash_path(first)}:$PATH{":" + _bash_path(last) if last else ""}"; {cmd}'
         args, err = sb.wrap(inner, cwd, sandbox, timeout)

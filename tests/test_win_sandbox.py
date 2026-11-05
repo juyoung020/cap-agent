@@ -1,6 +1,7 @@
 """Windows 자체 격리(AppContainer): 판정·배선은 어디서나, 실제 격리는 Windows 에서만."""
 import os
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,7 @@ def test_project_venv_gets_its_base_python_and_file_grants(tmp_path, monkeypatch
     (ws / ".venv" / "pyvenv.cfg").write_text(f"home = {base}\nversion = 3.11\n", encoding="utf-8")
     grants = []
     monkeypatch.setattr(A, "grant", lambda path, sid, rights, every_file=False: grants.append((path, rights, every_file)) or (True, ""))
+    monkeypatch.setattr(A, "medium_exes", lambda path: (True, ""))        # 실제 icacls 를 부르지 않게(리눅스 CI)
     st = {"sid": "S-1-15-2-1", "rx": []}
     monkeypatch.setattr(S, "_appc_save", lambda s: None)
     note = S._appc_project_venv(ws, st)
@@ -133,3 +135,14 @@ def test_prepared_workspace_relabels_executables_and_skips_nested_folders(tmp_pa
     state["exe_medium"] = []                                                           # 수정 전에 준비된 폴더
     S.appc_prepare(ws)
     assert ("medium", str(ws.resolve())) in calls
+
+
+def test_sitecustomize_replaces_unopenable_devnull(tmp_path):
+    """NUL 장치를 못 여는 컴퓨터(GitHub Actions Windows 의 격리 안): os.devnull 을 임시 폴더 파일로 바꾼다."""
+    from cap import appcontainer_exec as A
+    code = ("import os\nos.devnull = os.getcwd()\n"          # 폴더는 파일로 열 수 없다 = 못 여는 NUL 흉내
+            + A.SITECUSTOMIZE + "\nprint(os.devnull)\nopen(os.devnull, 'w').write('x')\n")
+    env = dict(os.environ, TEMP=str(tmp_path))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == os.path.join(str(tmp_path), "cap-devnull")

@@ -9,7 +9,7 @@ AppContainer 안에서는 Git Bash·PowerShell 이 뜨지 않아 셸이 cmd.exe 
 - 출력은 UTF-8, 종료 코드는 원래 도구처럼(grep: 찾음 0·없음 1·오류 2).
 - grep -r·find·dir /s 는 .git·.venv·node_modules·__pycache__·.cap 같은 폴더 안으로 들어가지 않는다(출력이 모델에게 감).
 cmd 자체 명령(mkdir·dir)은 .cmd 로 덮지 못하므로 translate() 가 명령 줄에서 cap-mkdir·cap-dir 로 바꾼다
-(그 밖에 export X=Y·X=Y cmd → set, /dev/null → NUL, '…' → "…", "; " → "& ").
+(그 밖에 export X=Y·X=Y cmd → set, /dev/null → 격리 임시 파일, '…' → "…", "; " → "& ").
 """
 from __future__ import annotations
 
@@ -959,9 +959,12 @@ def _unquote(v: str) -> str:
     return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
 
 
+DEVNULL_OUT = '"%TEMP%\\cap-devnull"'      # 격리 안 TEMP = 작업 폴더/.cap/sbx/tmp (NUL 을 못 여는 컴퓨터가 있다)
+
+
 def translate(line: str) -> str:
     """cmd.exe 에 넘기기 전에 흔한 bash 습관을 조심스럽게 옮긴다(따옴표 안은 건드리지 않음):
-    mkdir -p a/b → cap-mkdir, dir → cap-dir, export X=Y / X=Y cmd → set "X=Y" &&, >/dev/null → >NUL,
+    mkdir -p a/b → cap-mkdir, dir → cap-dir, export X=Y / X=Y cmd → set "X=Y" &&, >/dev/null → 격리 임시 파일(</dev/null → <NUL),
     '…' → "…"(안에 " 가 없을 때), "a; b" → "a & b". 나머지는 그대로."""
     t = _lex(line)
     for k, tok in enumerate(t):
@@ -969,7 +972,13 @@ def translate(line: str) -> str:
             tok[1] = "&" if k and t[k - 1][0] == "ws" else " &"
         elif tok[0] == "word":
             w = re.sub(r"^((?:[^'\"]*=)?)'([^'\"]*[^'\"\\])'$", r'\1"\2"', tok[1])
-            tok[1] = re.sub(r"(^|[<>])/dev/null$", r"\1NUL", w)
+            prev = next((x[1] for x in reversed(t[:k]) if x[0] != "ws"), "")
+            m = re.match(r"^(.*?)/dev/null$", w)
+            if m and (m.group(1).endswith(">") or (not m.group(1) and prev.endswith(">"))):
+                w = m.group(1) + DEVNULL_OUT              # 출력 버리기: NUL 을 못 여는 컴퓨터가 있어 격리 임시 파일로
+            elif m and (m.group(1).endswith("<") or (not m.group(1) and prev.endswith("<"))):
+                w = m.group(1) + "NUL"
+            tok[1] = w
     k = 0
     while k < len(t):
         kind, w = t[k]

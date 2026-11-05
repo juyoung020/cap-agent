@@ -74,7 +74,7 @@ def test_all_shell_paths_use_the_same_order(tmp_path, monkeypatch):
     from cap import sandbox as sb
     monkeypatch.setattr(sb, "wrap", lambda inner, cwd, b, timeout=None: (seen.append(inner) or ["x"], ""))
     T.shell_args("python -V", tmp_path, "appcontainer")
-    assert seen[-1].startswith(f'chcp 65001 >nul && set "PATH={d.absolute()};%PATH%;{OWN}"')
+    assert seen[-1].startswith(f'chcp 65001 >"%TEMP%\\cap-devnull" 2>&1 & set "PATH={d.absolute()};%PATH%;{OWN}"')
     if T.find_bash():
         T.shell_args("python -V", tmp_path, "landlock")
         assert seen[-1].startswith(f'export PATH="{T._bash_path(str(d.absolute()))}:$PATH:{T._bash_path(OWN)}"')
