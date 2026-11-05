@@ -5,6 +5,7 @@ ToolBox 는 실행기다. 권한 판정은 policy.classify 가 먼저 한다(여
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -35,7 +36,8 @@ TOOL_SCHEMAS = [
         ["pattern"]),
     _fn("edit_file", "Replace text in a file. `old` must be copied from the file (with indentation) "
         "and be unique; include a nearby line if needed. To change several places in one file at once, pass "
-        "`edits` (a list of {old, new}, applied top to bottom; all or nothing) instead of old/new.",
+        "`edits` (a list of {old, new}, applied top to bottom; all or nothing) instead of old/new. "
+        "On success it returns a short diff of what changed, so you do not need to read the file again.",
         {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"},
          "edits": {"type": "array", "maxItems": 10, "items": {"type": "object", "properties": {
              "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["old", "new"]}}},
@@ -43,9 +45,12 @@ TOOL_SCHEMAS = [
     _fn("write_file", "Create a new file, or overwrite a file you have fully read.",
         {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     _fn("run", "Run a shell command in the workspace (bash on this machine). Set background=true for servers or "
-        "long jobs; then check them with the process tool. Set escalate=true only if the command failed because of "
+        "long jobs; then check them with the process tool. A command still running after 30 s (or `timeout` seconds) "
+        "keeps running in the background as bgN. Set escalate=true only if the command failed because of "
         "the sandbox (no network, no writes outside the workspace) and really needs it — the user will be asked.",
-        {"cmd": {"type": "string"}, "background": {"type": "boolean"}, "escalate": {"type": "boolean"}}, ["cmd"]),
+        {"cmd": {"type": "string"}, "background": {"type": "boolean"}, "escalate": {"type": "boolean"},
+         "timeout": {"type": "number", "description": "seconds to wait before moving it to the background (max 600)"}},
+        ["cmd"]),
     _fn("run_tests", "Run the project's tests. target: optional test file or node id.",
         {"target": {"type": "string"}}, []),
     _fn("todo", "Track your plan. items: list of {text, done}.",
@@ -135,7 +140,7 @@ def clip(text: str, limit: int = MAX_OUT) -> str:
 class EditResult:
     ok: bool
     message: str
-    stage: str = ""          # exact | rstrip | indent | already_applied
+    stage: str = ""          # exact | rstrip | indent | unicode | spaces | already_applied
     new_text: str | None = None
 
 
@@ -167,6 +172,15 @@ def _nospace(s: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
+# 모델이 ASCII 로 옮겨 적는 유니코드 문장부호: 대시·빼기, 둥근 따옴표, 말줄임표, 특수 공백
+_UNI = str.maketrans({**{chr(c): "-" for c in range(0x2010, 0x2016)}, "−": "-",
+                      "‘": "'", "’": "'", "‚": "'", "‛": "'",
+                      "“": '"', "”": '"', "„": '"', "‟": '"', "…": "...",
+                      " ": " ", **{chr(c): " " for c in range(0x2002, 0x200b)}, " ": " ", "　": " "})
+
+
+def _unicode(s: str) -> str:
+    return s.translate(_UNI).strip()
 
 
 def _match_places(text: str, old: str, limit: int = 5) -> str:
@@ -198,12 +212,37 @@ def _data_error(path: str, text: str) -> str:
                 import yaml
             except ImportError:
                 return ""
-            yaml.safe_load(text)
+            for _ in yaml.compose_all(text, Loader=yaml.SafeLoader):   # 문법만(!Sub 같은 태그는 받아 준다)
+                pass
         else:
             return ""
     except Exception as exc:  # noqa: BLE001 — 형식별 예외가 제각각
         return str(exc).splitlines()[0][:160]
     return ""
+
+
+def data_break(path: str, before: str | None, after: str) -> str:
+    """after 가 JSON·TOML·YAML 문법을 깨면 그 오류(원래 멀쩡했거나 새 파일일 때만). 쓰기 전에 거부하는 데 쓴다."""
+    err = _data_error(path, after)
+    if not err or (before is not None and _data_error(path, before)):
+        return ""
+    return err
+
+
+def edit_diff(before: str, after: str, max_lines: int = 25, max_chars: int = 1200) -> str:
+    """편집 결과를 짧은 unified diff 로(@@ 줄 포함, 앞뒤 1줄). 길면 자른다."""
+    import difflib
+    dl = list(difflib.unified_diff(before.replace("\r\n", "\n").splitlines(),
+                                   after.replace("\r\n", "\n").splitlines(), n=1, lineterm=""))[2:]
+    out, size = [], 0
+    for k, ln in enumerate(dl):
+        ln = ln if len(ln) <= 200 else ln[:200] + "…"
+        if len(out) >= max_lines or size + len(ln) + 1 > max_chars:
+            out.append(f"…[diff truncated: {len(dl) - k} more lines]")
+            break
+        out.append(ln)
+        size += len(ln) + 1
+    return "\n".join(out)
 
 
 def syntax_note(path: str, before: str | None, after: str) -> str:
@@ -237,6 +276,18 @@ def strip_line_numbers(s: str) -> str:
     if body and all(LINE_NO.match(ln) for ln in body):
         return "\n".join(LINE_NO.sub("", ln, count=1) for ln in lines) + ("\n" if s.endswith("\n") else "")
     return s
+
+
+def strip_numbered_content(s: str) -> tuple[str, str]:
+    """write_file 내용의 'N| ' 접두사: 모든 줄이 연속 번호면 벗긴 내용, 60% 이상이면 (원문, 거부 사유)."""
+    body = [ln for ln in s.splitlines() if ln.strip()]
+    nums = [int(m.group(0).strip().rstrip("|").strip()) for m in (LINE_NO.match(ln) for ln in body) if m]
+    if not body or len(nums) < 0.6 * len(body):
+        return s, ""
+    if len(nums) == len(body) and all(b == a + 1 for a, b in zip(nums, nums[1:])):
+        return strip_line_numbers(s), ""
+    return s, (f"{len(nums)} of {len(body)} non-empty lines start with a line-number prefix like '12| ' "
+               "copied from read_file output. The file was not changed. Send the content without those prefixes.")
 
 
 def closest_lines_hint(text: str, old: str, top: int = 3) -> str:
@@ -352,8 +403,10 @@ def apply_edit(text: str, old: str, new: str) -> EditResult:
         new_lines = _strip_blank_edges(new_lines) if new.strip() else new_lines
     new_lines = [_restore_spacing(ln, text) for ln in new_lines]
     for stage, norm in (("rstrip", lambda s: s.rstrip()), ("indent", lambda s: s.strip()),
-                        ("spaces", _nospace)):
+                        ("unicode", _unicode), ("spaces", _nospace)):
         hits = _find_line_block(lines, old_lines, norm)
+        if stage == "unicode" and hits and _find_line_block(lines, old_lines, _nospace):
+            continue        # 공백만 다른 경우는 예전처럼 spaces 단계가 맡는다(이전에 맞던 편집의 결과·단계를 그대로)
         if len(hits) > 1:
             where = " 일치 위치: " + " | ".join(f"L{h + 1}: {lines[h].strip()[:60]}" for h in hits[:5])
             return EditResult(False, f"old 가 {len(hits)}곳과 일치한다({stage}). 고유한 줄을 더 넣어라." + where)
@@ -364,7 +417,7 @@ def apply_edit(text: str, old: str, new: str) -> EditResult:
                 # 9B 가 줄 안 띄어쓰기를 바꿔 복사한 경우: old 와 공백만 다른 new 줄은 파일 원래 줄을 그대로 쓴다
                 orig = {_nospace(old_lines[k]): lines[i + k] for k in range(len(old_lines))}
                 repl = [orig.get(_nospace(ln), ln) if ln.strip() else ln for ln in repl]
-            if stage in ("indent", "spaces") and old_lines:
+            if stage in ("indent", "unicode", "spaces") and old_lines:
                 # 들여쓰기 재정렬: 파일 쪽 첫 줄 들여쓰기 - old 첫 줄 들여쓰기 만큼 new 를 옮긴다
                 file_ind = _indent_of(lines[i])
                 old_ind = _indent_of(old_lines[0])
@@ -377,8 +430,17 @@ def apply_edit(text: str, old: str, new: str) -> EditResult:
                     else:
                         fixed.append(file_ind + ln.lstrip())
                 repl = fixed
+            if stage == "unicode":
+                # 둥근 따옴표·대시를 ASCII 로 옮겨 적은 경우: old 와 같아지는 new 줄은 파일 원래 줄을 그대로 쓴다
+                orig = {_unicode(old_lines[k]): lines[i + k] for k in range(len(old_lines))}
+                repl = [orig.get(_unicode(ln), ln) if ln.strip() else ln for ln in repl]
             out = lines[:i] + repl + lines[i + len(old_lines):]
             return EditResult(True, "ok", stage, nl.join(out))
+    # 인자가 두 번 이스케이프됐나? 진짜 줄바꿈 없이 글자 '\n' 만 있고, 그걸 줄바꿈으로 바꾸면 파일에 있다(고치지는 않는다)
+    if "\n" not in old and "\\n" in old and old.replace("\\n", "\n") in text.replace("\r\n", "\n"):
+        return EditResult(False, "old has no real line breaks but contains the two characters \\n, and with real "
+                          "line breaks it is in the file: the arguments were escaped twice. Send real line breaks "
+                          "in old and new (not \\\\n). Nothing was changed.")
     # 이미 적용됐나? 짧은 new 는 파일 어딘가에 우연히 있을 수 있어 8자 이상일 때만(Hermes 07 §4-7)
     if len(new.strip()) >= 8:
         if new in text or _find_line_block(lines, _strip_blank_edges(new.replace("\r\n", "\n").split("\n")),
@@ -405,12 +467,66 @@ def find_bash() -> str | None:
     return None
 
 
-def shell_env() -> dict:
+def _python_dir(d: Path) -> Path | None:
+    """d 또는 d/Scripts(Windows)·d/bin 중 파이썬 실행 파일이 있는 폴더."""
+    names = ("python.exe",) if os.name == "nt" else ("python", "python3")
+    for x in (d, d / ("Scripts" if os.name == "nt" else "bin")):
+        if any((x / n).is_file() for n in names):
+            return x
+    return None
+
+
+def project_python_dir(ws: Path | None) -> Path | None:
+    """명령이 쓸 프로젝트 파이썬 폴더: .cap/settings.json "python"(실행 파일이나 그 폴더) > ws/.venv·ws/venv > VIRTUAL_ENV.
+    없으면 None — 그때는 CAP 자신의 파이썬이 잡힌다(uv tool 설치면 프로젝트 의존성이 없다)."""
+    if ws is None:
+        return None
+    try:
+        v = json.loads((ws / ".cap" / "settings.json").read_text(encoding="utf-8")).get("python")
+    except (OSError, ValueError, AttributeError):
+        v = None
+    cands = []
+    if isinstance(v, str) and v.strip():
+        p = Path(v.strip()).expanduser()
+        cands.append(p if p.is_absolute() else ws / p)
+    cands += [ws / ".venv", ws / "venv"] + ([Path(os.environ["VIRTUAL_ENV"])] if os.environ.get("VIRTUAL_ENV") else [])
+    for p in cands:
+        d = p.parent if p.is_file() else _python_dir(p) if p.is_dir() else None
+        if d:
+            return d.absolute()
+    return None
+
+
+def _path_dirs(ws: Path | None) -> tuple[str, str]:
+    """PATH 맨 앞·맨 뒤에 붙일 폴더. 프로젝트 파이썬이 있으면 그것이 앞, CAP 자신의 폴더는 뒤(pytest 등이 없을 때 대비)."""
+    own = str(Path(sys.executable).parent)
+    proj = project_python_dir(ws)
+    if proj and os.path.normcase(str(proj)) != os.path.normcase(own):
+        return str(proj), own
+    return own, ""
+
+
+def python_note(ws: Path) -> str:
+    """/doctor 한 줄: 명령이 쓰는 파이썬."""
+    proj = project_python_dir(ws)
+    if proj:
+        return f"commands use the project's python in {proj}"
+    return (f"commands use CAP's own python in {Path(sys.executable).parent} (no .venv/venv, VIRTUAL_ENV "
+            'or "python" in .cap/settings.json)')
+
+
+QUIET_ENV = {"NO_COLOR": "1", "TERM": "dumb", "PAGER": "cat", "GIT_PAGER": "cat", "GH_PAGER": "cat", "COLORTERM": ""}
+
+
+def shell_env(ws: Path | None = None) -> dict:
     env = dict(os.environ)
-    scripts = str(Path(sys.executable).parent)
-    env["PATH"] = scripts + os.pathsep + env.get("PATH", "")
+    first, last = _path_dirs(ws)
+    env["PATH"] = first + os.pathsep + env.get("PATH", "") + (os.pathsep + last if last else "")
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.update(QUIET_ENV)       # 색·페이저·대화형 출력 끄기(Codex 처럼): 출력이 모델에게 그대로 가므로
+    for k in ("FORCE_COLOR", "CLICOLOR_FORCE"):
+        env.pop(k, None)
     for k in list(env):     # 자식 프로세스에 키·토큰을 넘기지 않는다(이름으로 거름, Hermes 06 §9)
         if k in ("KAU_API_KEY", "CAP_API_KEY") or SECRET_ENV.search(k):
             env.pop(k, None)
@@ -460,31 +576,52 @@ def _decode(b: bytes | None) -> str:
     return "\n".join(out)
 
 
-def run_shell(cmd: str, cwd: Path, timeout: int = 180, sandbox: str = "") -> tuple[int, str]:
-    """sandbox: "" 이면 그대로, 아니면 그 격리 방식(sandbox.py)으로 감싸서 돌린다."""
+def _bash_path(d: str) -> str:
+    d = Path(d).as_posix()
+    return "/" + d[0].lower() + d[2:] if re.match(r"^[A-Za-z]:/", d) else d     # Git Bash: C:/x → /c/x
+
+
+def shell_args(cmd: str, cwd: Path, sandbox: str = "", timeout: int | None = None,
+               pyws: Path | None = None) -> tuple[Any, bool, str]:
+    """run_shell·bg_start 가 같이 쓰는 실행 인자 (args, shell, 오류). 오류가 있으면 격리를 띄우지 못한 것.
+    프로젝트 파이썬 폴더(pyws, 기본 cwd)가 PATH 맨 앞, CAP 자신의 폴더는 맨 뒤(프로젝트 파이썬이 없으면 맨 앞)."""
     bash = find_bash()
-    env = shell_env()
+    first, last = _path_dirs(pyws or cwd)
     if sandbox:
         from . import sandbox as sb
         inner = cmd
         if sandbox == "appcontainer":          # Windows 격리: cmd.exe, venv 파이썬이 먼저 잡히게
-            inner = f'chcp 65001 >nul && set "PATH={Path(sys.executable).parent};%PATH%" && {cmd}'
+            inner = f'chcp 65001 >nul && set "PATH={first};%PATH%{";" + last if last else ""}" && {cmd}'
         elif sandbox != "wsl" and bash:          # 리눅스: venv 파이썬이 먼저 잡히게(WSL 은 리눅스 쪽 도구를 쓴다)
-            inner = f'export PATH="{Path(sys.executable).parent.as_posix()}:$PATH"; {cmd}'
+            inner = f'export PATH="{_bash_path(first)}:$PATH{":" + _bash_path(last) if last else ""}"; {cmd}'
         args, err = sb.wrap(inner, cwd, sandbox, timeout)
         if args is None:
-            return 1, f"[sandbox] could not start the sandbox: {err}. The command was not run."
-        shell = False
-    elif bash:
-        # Git Bash 에서 venv 파이썬이 먼저 잡히도록
-        scripts = Path(sys.executable).parent.as_posix()
-        if re.match(r"^[A-Za-z]:/", scripts):
-            scripts = "/" + scripts[0].lower() + scripts[2:]
-        full = f'export PATH="{scripts}:$PATH"; {cmd}'
-        args: Any = [bash, "-c", full]
-        shell = False
-    else:
-        args, shell = cmd, True
+            return None, False, err
+        return args, False, ""
+    if bash:                                     # Git Bash 에서 venv 파이썬이 먼저 잡히도록
+        full = f'export PATH="{_bash_path(first)}:$PATH{":" + _bash_path(last) if last else ""}"; {cmd}'
+        return [bash, "-c", full], False, ""
+    return cmd, True, ""
+
+
+def sandbox_note(code: int, out: str, sandbox: str) -> tuple[int, str]:
+    """격리 안에서 돈 명령의 출력에 붙이는 설명(격리가 막았거나 못 띄웠을 때)."""
+    if sandbox:
+        from . import sandbox as sb
+        if code == 97 and "landlock_exec:" in out:
+            return 1, out + "\n[sandbox] the sandbox could not start, so the command was not run."
+        out += sb.note_if_blocked(code, out)
+    return code, out
+
+
+def run_shell(cmd: str, cwd: Path, timeout: int = 180, sandbox: str = "",
+              pyws: Path | None = None) -> tuple[int, str]:
+    """sandbox: "" 이면 그대로, 아니면 그 격리 방식(sandbox.py)으로 감싸서 돌린다.
+    pyws: 어느 작업 폴더의 파이썬을 쓸지(기본 cwd — 임시 폴더에서 돌릴 때 원래 작업 폴더를 넘긴다)."""
+    args, shell, err = shell_args(cmd, cwd, sandbox, timeout, pyws)
+    if err:
+        return 1, f"[sandbox] could not start the sandbox: {err}. The command was not run."
+    env = shell_env(pyws or cwd)
     # 새 프로세스 그룹으로 띄우고, 시간이 넘으면 자식·손자까지 통째로 죽인다
     # (bash 만 죽이면 그 아래 python 이 파이프를 쥐고 있어 communicate 가 끝나지 않는다 — 무한 루프 코드에서 멈춤)
     kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
@@ -500,13 +637,27 @@ def run_shell(cmd: str, cwd: Path, timeout: int = 180, sandbox: str = "") -> tup
             so, se = b"", b""
         out = (so or b"").decode("utf-8", "replace") + (se or b"").decode("utf-8", "replace")
         return 124, clip(out, 3000) + f"\n[timed out after {timeout}s — process tree killed]"
-    out = _decode(so) + _decode(se)
-    if sandbox:
-        from . import sandbox as sb
-        if p.returncode == 97 and "landlock_exec:" in out:
-            return 1, out + "\n[sandbox] the sandbox could not start, so the command was not run."
-        out += sb.note_if_blocked(p.returncode, out)
-    return p.returncode, out
+    return sandbox_note(p.returncode, _decode(so) + _decode(se), sandbox)
+
+
+YIELD_S = 30      # run 이 이만큼 기다려도 안 끝나면 백그라운드로 넘긴다(서버를 background 없이 띄워도 멈추지 않게)
+
+
+def run_yield(cmd: str, cwd: Path, sandbox: str = "", limit: float = YIELD_S) -> tuple[int | None, str, str]:
+    """백그라운드 명령처럼 띄워 limit 초까지 기다린다(Codex 의 yield). 끝나면 (exit, 출력, "") 이고 백그라운드 표에서 지운다.
+    아직 돌면 (None, 지금까지의 출력, "bgK") — 그 뒤로는 process 도구로 본다. 격리를 못 띄우면 RuntimeError."""
+    from . import extras as ext
+    pid = ext.bg_start(cwd, cmd, sandbox=sandbox, stdin=False)
+    v = ext._find(cwd, pid)
+    try:
+        v["proc"].wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        data = v["log"].read_bytes()
+        cut = ext.utf8_cut(data)
+        v["model_pos"] = cut                    # 여기서 보여 준 데까지는 process(output) 가 다시 보내지 않는다
+        return None, _decode(data[:cut]), pid
+    code = v["proc"].returncode
+    return (*sandbox_note(code, _decode(ext.bg_take(cwd, pid)), sandbox), "")
 
 
 def _kill_tree(p: subprocess.Popen) -> None:
@@ -528,6 +679,8 @@ class ToolBox:
     todos: list[dict] = field(default_factory=list)
     file_hashes: dict[str, str] = field(default_factory=dict)   # CAP 이 마지막으로 읽거나 쓴 내용의 해시
     edit_fails: dict[str, int] = field(default_factory=dict)    # 파일별 연속 편집 실패 수
+    # 나눠 읽은 줄 범위 {path: {"hash", "ranges": [[a, b], ...]}} — 같은 내용에서 1~끝을 다 덮으면 통째로 읽은 셈
+    read_ranges: dict[str, dict] = field(default_factory=dict)
     sandbox: str = ""            # 명령 격리 방식(sandbox.py). "" = 격리 없음
     unsandboxed_once: bool = False   # 이번 호출만 격리 밖(사람이 허락한 설치·네트워크 명령, escalate)
 
@@ -595,7 +748,24 @@ class ToolBox:
                 k += 1
             body = "\n".join(acc) + f"\n…[잘림: {k}번째 줄부터 offset={k} 로 이어 읽어라]"
             end = k - 1
+        if not notebook and start <= end:
+            self._note_range(rel(self.ws, fp), file_hash(fp), start, end, n)
         return {"ok": True, "output": f"[{rel(self.ws, fp)} 줄 {start}-{end} / 전체 {n}]\n{body}", "changed": []}
+
+    def _note_range(self, r: str, h: str, a: int, b: int, n: int) -> None:
+        """실제로 보여 준 줄 범위를 합친다(내용이 바뀌었으면 새로 시작). 1~n 을 다 덮으면 통째로 읽은 것으로."""
+        cur = self.read_ranges.get(r) or {}
+        old = (cur.get("ranges") or []) if cur.get("hash") == h else []
+        merged: list[list[int]] = []
+        for x, y in sorted([list(p) for p in old] + [[a, b]]):
+            if merged and x <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], y)
+            else:
+                merged.append([x, y])
+        self.read_ranges[r] = {"hash": h, "ranges": merged}
+        if merged[0][0] <= 1 and merged[0][1] >= n:
+            self.full_reads.add(r)
+            self.file_hashes[r] = h
 
     def t_search(self, pattern: str, path: str = ".") -> dict:
         base = self.p(path or ".")
@@ -653,16 +823,24 @@ class ToolBox:
         self.edit_fails.pop(r, None)
         if res.new_text is None:
             return {"ok": True, "output": res.message, "changed": [], "stage": res.stage}
+        bad = data_break(r, raw, res.new_text)
+        if bad:                                 # 멀쩡하던 JSON·TOML·YAML 을 깨는 편집은 쓰기 전에 거부
+            return {"ok": False, "output": f"Not applied: after this edit {r} would no longer parse ({bad}). "
+                                           "The file was not changed. Fix the edit and try again.",
+                    "changed": [], "stage": "refused"}
         warn = ""
         if r in self.file_hashes and self.file_hashes[r] != file_hash(fp):
             warn = f"\nNote: {r} changed on disk since you last read it; your edit matched the current text."
         fp.write_bytes(res.new_text.encode("utf-8"))
         self.file_hashes[r] = file_hash(fp)
+        diff = "" if "no_diff" in os.getenv("CAP_ABLATION", "") else edit_diff(raw, res.new_text)
+        if diff:
+            diff = f"\n{diff}\nThe file now contains this change; no need to re-read it."
         note = syntax_note(r, raw, res.new_text)
         if not note:
             from .extras import lint_delta
             note = lint_delta(r, raw, res.new_text)
-        return {"ok": True, "output": f"편집 적용({res.stage})" + warn + note, "changed": [r],
+        return {"ok": True, "output": f"편집 적용({res.stage})" + warn + diff + note, "changed": [r],
                 "stage": res.stage, "syntax_error": bool(note)}
 
     def check_edit(self, path: str, old: str, new: str, edits: list | None = None) -> str:
@@ -673,13 +851,18 @@ class ToolBox:
         raw = fp.read_bytes().decode("utf-8", errors="replace")
         res = apply_edit_args(raw, {"old": old, "new": new, "edits": edits})
         if res.ok:
-            return ""
+            bad = data_break(rel(self.ws, fp), raw, res.new_text) if res.new_text is not None else ""
+            return f"after this edit {rel(self.ws, fp)} would no longer parse ({bad})." if bad else ""
         if edits:
             return res.message
         return res.message + ("" if "일치한다" in res.message else closest_lines_hint(raw, strip_line_numbers(old)))
 
-    def check_write(self, path: str) -> str:
-        """write_file 이 거부될 이유(승인 전에 확인). 없으면 ""."""
+    def check_write(self, path: str, content: str | None = None) -> str:
+        """write_file 이 거부될 이유(승인 전에 확인). 없으면 "". content 를 주면 내용도 본다(줄 번호 접두사·데이터 문법)."""
+        stale = self._stale_write(path)
+        return stale or (self._bad_content(path, content) if content is not None else "")
+
+    def _stale_write(self, path: str) -> str:
         fp = self.p(path)
         r = rel(self.ws, fp)
         if not fp.exists():
@@ -692,23 +875,42 @@ class ToolBox:
                     "read_file it again, merge, then write_file again — or use edit_file.")
         return ""
 
+    def _bad_content(self, path: str, content: str) -> str:
+        content, why = strip_numbered_content(content)
+        if why:
+            return why
+        fp = self.p(path)
+        before = fp.read_text(encoding="utf-8", errors="replace") if fp.is_file() else None
+        bad = data_break(rel(self.ws, fp), before, content)
+        if bad:
+            return (f"the new content of {rel(self.ws, fp)} does not parse ({bad}). The file was not changed. "
+                    "Fix the syntax and write it again.")
+        return ""
+
     def t_write_file(self, path: str, content: str) -> dict:
         fp = self.p(path)
         r = rel(self.ws, fp)
-        refuse = self.check_write(path)       # Hermes 07 §5-7: 읽지 않았거나 읽은 뒤 바뀐 파일은 덮어쓰지 않는다
+        refuse = self._stale_write(path)       # Hermes 07 §5-7: 읽지 않았거나 읽은 뒤 바뀐 파일은 덮어쓰지 않는다
         if refuse:
             return {"ok": False, "output": refuse, "changed": [], "stale_write_blocked": True}
+        stripped, _ = strip_numbered_content(content)
+        refuse = self._bad_content(path, stripped)   # 줄 번호가 섞였거나 멀쩡하던 데이터 파일을 깨면 쓰지 않는다
+        if refuse:
+            return {"ok": False, "output": refuse, "changed": [], "write_refused": True}
+        tag = " (removed the line-number prefixes copied from read_file)" if stripped != content else ""
+        content = stripped
         before = fp.read_text(encoding="utf-8", errors="replace") if fp.exists() else None
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_bytes(content.encode("utf-8"))
         self.full_reads.add(r)
         self.file_hashes[r] = file_hash(fp)
+        self.read_ranges.pop(r, None)
         note = syntax_note(r, before, content)
         syn = bool(note)
         if not note:
             from .extras import lint_delta
             note = lint_delta(r, before, content)
-        return {"ok": True, "output": f"{r} 저장({len(content)}자)" + note, "changed": [r], "syntax_error": syn}
+        return {"ok": True, "output": f"{r} 저장({len(content)}자)" + tag + note, "changed": [r], "syntax_error": syn}
 
     def t_apply_patch(self, patch: str) -> dict:
         """Codex apply_patch: 여러 파일을 한 번에. 모든 청크가 맞아야 쓴다(하나라도 실패하면 아무것도 안 바뀜)."""
@@ -751,6 +953,7 @@ class ToolBox:
                 fp.unlink(missing_ok=True)
                 self.file_hashes.pop(r, None)
                 self.full_reads.discard(r)
+                self.read_ranges.pop(r, None)
                 notes.append(f"deleted {r}")
             else:
                 before = fp.read_text(encoding="utf-8", errors="replace") if fp.is_file() else None
@@ -758,6 +961,7 @@ class ToolBox:
                 fp.write_bytes(content.encode("utf-8"))
                 self.file_hashes[r] = file_hash(fp)
                 self.full_reads.add(r)
+                self.read_ranges.pop(r, None)
                 notes.append(("updated " if before is not None else "added ") + r + syntax_note(r, before, content))
             changed.append(r)
         return {"ok": True, "output": "patch applied: " + "; ".join(notes), "changed": changed}
@@ -797,7 +1001,7 @@ class ToolBox:
         sb, self.unsandboxed_once = ("" if self.unsandboxed_once else self.sandbox), False
         return "" if escalate else sb
 
-    def t_run(self, cmd: str, background: bool = False, escalate: bool = False) -> dict:
+    def t_run(self, cmd: str, background: bool = False, escalate: bool = False, timeout: float | None = None) -> dict:
         sb = self._sandbox_for_this_call(escalate)
         if background:
             from .extras import bg_start
@@ -805,13 +1009,26 @@ class ToolBox:
             return {"ok": True, "output": f"[started in background as {pid}] {cmd}\nCheck it with "
                                           f"process(action=\"output\", id=\"{pid}\"); stop it with action=\"kill\".",
                     "changed": [], "exit": 0}
+        try:
+            limit = max(1.0, min(float(timeout), 600.0)) if timeout else float(YIELD_S)
+        except (TypeError, ValueError):
+            limit = float(YIELD_S)
         before = self._mtimes()
-        code, out = run_shell(cmd, self.ws, sandbox=sb)
+        try:
+            code, out, pid = run_yield(cmd, self.ws, sandbox=sb, limit=limit)
+        except RuntimeError as exc:
+            code, out, pid = 1, f"[sandbox] {exc}. The command was not run.", ""
         after = self._mtimes()
         changed = sorted(k for k in after if before.get(k) != after[k]) + sorted(k for k in before if k not in after)
         for k in changed:                      # 명령이 바꾼 파일은 다시 읽어야 통째로 덮어쓸 수 있다
             self.full_reads.discard(k)
             self.file_hashes.pop(k, None)
+            self.read_ranges.pop(k, None)
+        if code is None:                       # 아직 도는 중: 백그라운드로 넘어갔다(서버·긴 작업)
+            head = (f"[still running after {limit:.0f}s as {pid} — partial output below — check it with "
+                    f"process(action=\"output\", id=\"{pid}\", wait=30) or stop it with action=\"kill\"]")
+            return {"ok": True, "output": spill(self.ws, f"{head}\n{out or '(no output yet)'}"), "changed": changed,
+                    "exit": None, "background": pid}
         return {"ok": code == 0, "output": spill(self.ws, f"[exit {code}]\n{out}"), "changed": changed, "exit": code}
 
     def t_run_tests(self, target: str = "") -> dict:

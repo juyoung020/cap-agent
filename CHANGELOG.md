@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-05
+
+### Added
+- Repairs wrong tool and argument names from small models (`str_replace`, `old_string`, `bash`, `command`, …); escalates after three rounds without a valid call.
+- Nudges once when a reply says "I'll do X" but makes no tool call; `/goal` stops when nothing progresses.
+- Editing: Unicode punctuation/space normalisation stage, double-escape detection, pieced-together reads count as a full read, applied diff shown after an edit; `write_file` strips copied line numbers and refuses broken JSON/TOML/YAML before writing.
+- Commands run with the project's own `.venv` Python; quiet environment (no colour, no pager); `run` longer than 30 s moves to the background; background output returns only new output.
+- Helper model calls never use thinking mode; call errors are classified with a fix (bad key, unknown model, server not running); replies that repeat themselves are cut early.
+- Test command and instruction files are re-checked every turn; large MCP schemas are compacted and large MCP results spilled to `.cap/outputs`.
+- Mid-turn compaction first shortens old tool outputs and only then summarises.
+
+### Fixed
+- A test file failing at import no longer makes CAP claim other tests "passed before"; baseline and `/goal` test runs now use the sandbox.
+- The auto-compaction threshold follows the model's context window.
+- Windows sandbox: project `.venv` (including uv hard-linked files) and its base Python are readable.
+
 ## [0.8.0] - 2026-11-05
 
 ### Added
@@ -13,5 +29,6 @@ All notable changes to this project are documented here. The format follows [Kee
 - LangGraph coding loop with permission table, approvals, checkpoints (`/continue`), test gate, sub-agents.
 - Claude Code / Codex compatibility: skills, commands, sub-agents, hooks, MCP (tools, resources, prompts), plugins.
 
-[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/juyoung020/cap-agent/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/juyoung020/cap-agent/releases/tag/v0.8.0

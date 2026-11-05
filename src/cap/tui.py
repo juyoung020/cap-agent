@@ -989,7 +989,7 @@ class CapApp(App):
             except KeyboardInterrupt:
                 report(Text("■ Interrupted · tell CAP what to do instead", style=P["muted"]))
             except RuntimeError as exc:
-                report(Text(f"Error: {llm.scrub(str(exc))[:300]}  (session kept — /continue retries from the last step)", style=P["error"]), ErrorCell)
+                report(Text(f"Error: {llm.scrub(str(exc))[:300]}{llm.error_hint(exc)}", style=P["error"]), ErrorCell)
             except Exception as exc:  # noqa: BLE001 — 화면은 살려 둔다
                 report(Text(f"Error: {type(exc).__name__}: {llm.scrub(str(exc))[:300]}", style=P["error"]), ErrorCell)
             finally:

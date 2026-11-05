@@ -70,6 +70,7 @@ def _record_sandbox(monkeypatch, backend="landlock"):
         seen.append((cmd, sandbox))
         return 0, "ok"
     monkeypatch.setattr(T, "run_shell", fake_run_shell)
+    monkeypatch.setattr(T, "run_yield", lambda cmd, cwd, sandbox="", limit=30: fake_run_shell(cmd, cwd, 0, sandbox) + ("",))
     import cap.loop as L
     monkeypatch.setattr(L, "run_shell", fake_run_shell)
     return seen

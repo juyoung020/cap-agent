@@ -272,7 +272,7 @@ def test_glob_tool_lists_files_newest_first_and_stays_inside(tmp_path: Path):
 
 def test_ask_user_question_reaches_human_and_answer_goes_back(ws, monkeypatch):
     seen = script(monkeypatch, [{"tool_calls": [call("ask_user", question="Which style?", options=["tabs", "spaces"])]},
-                                {"content": "spaces 로 하겠습니다."}])
+                                {"content": "spaces 로 하겠습니다."}, {"content": "spaces 로 정했습니다."}])
     s, out = session(ws)
     asked = []
     s.run_turn("코드 스타일 정해줘", ask=lambda p: asked.append(p) or "spaces")

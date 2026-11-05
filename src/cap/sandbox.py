@@ -141,8 +141,9 @@ def appc_prepare(ws: Path) -> tuple[bool, str]:
     """이 작업 폴더에 격리의 읽기·쓰기 권한과 Low 무결성 레이블을 준다(폴더마다 한 번). 기록은 ~/.cap/sandbox.json."""
     st = _appc_state()
     key = str(ws.resolve())
+    venv_note = _appc_project_venv(ws, st)
     if key in st.get("workspaces", []):
-        return True, ""
+        return True, venv_note
     st["workspaces"] = [w for w in st.get("workspaces", []) if Path(w).is_dir()]   # 지워진 폴더(실험 임시 폴더 등)는 뺀다
     from . import appcontainer_exec as A
     ok, out = A.grant(key, st["sid"], "M")
@@ -153,6 +154,47 @@ def appc_prepare(ws: Path) -> tuple[bool, str]:
     st.setdefault("workspaces", []).append(key)
     _appc_save(st)
     return True, f"[sandbox] gave the Windows sandbox read+write access to {key} (undo: /sandbox undo)"
+
+
+def _project_venvs(ws: Path) -> list[tuple[Path, str]]:
+    """작업 폴더 안의 가상환경과 그 기본 파이썬 설치(pyvenv.cfg 의 home)."""
+    out = []
+    for name in (".venv", "venv"):
+        cfg = ws / name / "pyvenv.cfg"
+        if not cfg.is_file():
+            continue
+        home = ""
+        for ln in cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
+            k, _, v = ln.partition("=")
+            if k.strip().lower() == "home":
+                home = v.strip()
+        out.append((ws / name, home))
+    return out
+
+
+def _appc_project_venv(ws: Path, st: dict) -> str:
+    """프로젝트 .venv 를 격리 안에서 쓰게: ① 그 venv 의 기본 파이썬 설치(작업 폴더 밖)에 읽기·실행,
+    ② venv 파일 하나하나에 권한(uv 는 캐시를 하드 링크해서 작업 폴더의 상속 권한을 받지 않는다).
+    ②는 패키지가 바뀌었을 때(site-packages 시각)만 다시 한다."""
+    from . import appcontainer_exec as A
+    notes, changed = [], False
+    for venv, home in _project_venvs(ws):
+        if home and Path(home).is_dir() and home not in st.setdefault("rx", []):
+            ok, _ = A.grant(home, st["sid"], "RX", every_file=True)
+            if ok:
+                st["rx"].append(home)
+                changed = True
+                notes.append(f"read access to the project venv's Python ({home})")
+        site = next((p for p in (venv / "Lib" / "site-packages", venv / "lib") if p.is_dir()), venv)
+        stamp = str(site.stat().st_mtime_ns)
+        if st.setdefault("venvs", {}).get(str(venv)) != stamp:
+            ok, _ = A.grant(str(venv), st["sid"], "M", every_file=True)
+            if ok:
+                st["venvs"][str(venv)] = stamp
+                changed = True
+    if changed:
+        _appc_save(st)
+    return ("[sandbox] gave the Windows sandbox " + "; ".join(notes)) if notes else ""
 
 
 def appc_undo(ws: Path) -> str:

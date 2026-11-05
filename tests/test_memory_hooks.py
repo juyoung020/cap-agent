@@ -43,7 +43,7 @@ def test_skills_are_listed_and_opened_on_demand(ws, monkeypatch):
     (d / "SKILL.md").write_text("---\nname: release\ndescription: How to cut a release\n---\n1. bump version\n2. tag\n",
                                 encoding="utf-8")
     skill_call = {"id": "c_skill", "type": "function", "function": {"name": "skill", "arguments": '{"name": "release"}'}}
-    seen = script(monkeypatch, [{"tool_calls": [skill_call]}, {"content": "따라 하겠습니다."}])
+    seen = script(monkeypatch, [{"tool_calls": [skill_call]}, {"content": "따라 하겠습니다."}, {"content": "단계를 확인했습니다."}])
     s, _ = session(ws, "ask")
     s.run_turn("릴리스 해줘")
     assert "- release: How to cut a release" in seen[0][0]["content"] and "bump version" not in seen[0][0]["content"]

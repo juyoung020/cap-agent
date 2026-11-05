@@ -215,8 +215,9 @@ _PROCS: dict[str, dict[str, Any]] = {}
 _LOCK = threading.Lock()
 
 
-def bg_start(ws: Path, cmd: str, sandbox: str = "", extra_env: dict | None = None) -> str:
-    from .tools import find_bash, shell_env
+def bg_start(ws: Path, cmd: str, sandbox: str = "", extra_env: dict | None = None, stdin: bool = True) -> str:
+    """stdin=False: 입력을 받지 않는다(run 이 띄운 명령 — 예전처럼 input() 은 바로 EOF)."""
+    from .tools import shell_args, shell_env
     d = ws / ".cap" / "bg"
     d.mkdir(parents=True, exist_ok=True)
     with _LOCK:
@@ -225,19 +226,14 @@ def bg_start(ws: Path, cmd: str, sandbox: str = "", extra_env: dict | None = Non
             n += 1
         pid_id = f"bg{n}"
     log = d / f"{pid_id}.log"
-    bash = find_bash()
-    args: Any = [bash, "-c", cmd] if bash else cmd
-    if sandbox:                                       # 백그라운드 명령도 같은 격리 안에서
-        from .sandbox import wrap
-        wrapped, err = wrap(cmd, ws, sandbox)
-        if wrapped is None:
-            raise RuntimeError(f"sandbox could not start: {err}")
-        args, bash = wrapped, "sandbox"
+    args, shell, err = shell_args(cmd, ws, sandbox)     # run_shell 과 같은 감싸기(격리·PATH)
+    if err:
+        raise RuntimeError(f"sandbox could not start: {err}")
     kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     f = open(log, "wb")
-    env = {**shell_env(), **(extra_env or {})}          # extra_env: CAP 자신을 띄울 때만(모델 키)
-    p = subprocess.Popen(args, cwd=ws, env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.PIPE,
-                         shell=not bash, **kw)
+    env = {**shell_env(ws), **(extra_env or {})}          # extra_env: CAP 자신을 띄울 때만(모델 키)
+    p = subprocess.Popen(args, cwd=ws, env=env, stdout=f, stderr=subprocess.STDOUT,
+                         stdin=subprocess.PIPE if stdin else subprocess.DEVNULL, shell=shell, **kw)
     with _LOCK:
         _PROCS[pid_id + "@" + str(ws)] = {"id": pid_id, "ws": str(ws), "cmd": cmd, "proc": p, "log": log, "file": f,
                                           "started": time.time()}
@@ -269,6 +265,44 @@ def bg_output(ws: Path, pid_id: str, tail: int = 4000) -> tuple[bool, str]:
     return True, f"[{pid_id} {state}] {v['cmd'][:80]}\n" + (text[-tail:] or "(no output yet)")
 
 
+def utf8_cut(data: bytes) -> int:
+    """data 끝에 덜 쓰인 UTF-8 글자가 걸려 있으면 그 앞까지의 길이(다음에 이어서 읽는다)."""
+    for k in range(1, min(4, len(data)) + 1):
+        b = data[-k]
+        if b & 0xC0 == 0xC0:                      # 여러 바이트 글자의 첫 바이트
+            need = 4 if b >= 0xF0 else 3 if b >= 0xE0 else 2
+            return len(data) - k if need > k else len(data)
+        if b & 0x80 == 0:
+            break
+    return len(data)
+
+
+def bg_output_new(ws: Path, pid_id: str, wait: Any = 5, limit: int = 4000) -> tuple[bool, str]:
+    """모델용 process(output): 지난번에 보여 준 뒤로 새로 나온 출력만(Codex 처럼). 새 출력이 생기거나, 끝나거나,
+    wait 초(최대 30)가 지날 때까지 기다린다. 사람용 /bg 와 bg_output 은 그대로 꼬리를 보여 준다."""
+    from .tools import _decode, clip
+    v = _find(ws, pid_id)
+    if not v:
+        return False, f"no background process {pid_id}. " + bg_list(ws)
+    try:
+        wait = max(0.0, min(float(wait), 30.0))
+    except (TypeError, ValueError):
+        wait = 5.0
+    pos = v.get("model_pos", 0)
+    end = time.time() + wait
+    while v["proc"].poll() is None and time.time() < end and v["log"].stat().st_size <= pos:
+        time.sleep(0.1)
+    data = v["log"].read_bytes()
+    code = v["proc"].poll()
+    cut = len(data) if code is not None else utf8_cut(data)
+    new = _decode(data[pos:cut]) if cut > pos else ""
+    v["model_pos"] = max(pos, cut)
+    state = "running" if code is None else f"exited {code}"
+    total = f"{len(data) / 1000:.0f}k" if len(data) >= 1000 else f"{len(data)} chars"
+    return True, (f"[{pid_id} {state} · {len(new)} new chars · total {total}] {v['cmd'][:80]}\n"
+                  + (clip(new, limit) if new else "(no new output)"))
+
+
 def bg_write(ws: Path, pid_id: str, text: str, enter: bool = True, wait: float = 1.5) -> tuple[bool, str]:
     """실행 중인 백그라운드 명령의 입력(stdin)에 글을 보내고, 잠깐 기다린 뒤 새로 나온 출력을 돌려준다
     (Codex write_stdin: "계속할까요? [y/N]" 같은 질문에 답하거나 REPL 에 한 줄 넣기)."""
@@ -276,8 +310,10 @@ def bg_write(ws: Path, pid_id: str, text: str, enter: bool = True, wait: float =
     if not v:
         return False, f"no background process {pid_id}. " + bg_list(ws)
     p = v["proc"]
-    if p.poll() is not None or p.stdin is None:
+    if p.poll() is not None:
         return False, f"{pid_id} has already exited ({p.poll()})"
+    if p.stdin is None:
+        return False, f"{pid_id} does not take input (started by run without background=true)"
     v["file"].flush()
     start = v["log"].stat().st_size if v["log"].exists() else 0
     data = text + ("\n" if enter and not text.endswith("\n") else "")
@@ -290,7 +326,9 @@ def bg_write(ws: Path, pid_id: str, text: str, enter: bool = True, wait: float =
     while time.time() < end and p.poll() is None:
         time.sleep(0.1)
     v["file"].flush()
-    new = v["log"].read_bytes()[start:].decode("utf-8", "replace")
+    data = v["log"].read_bytes()
+    new = data[start:].decode("utf-8", "replace")
+    v["model_pos"] = max(v.get("model_pos", 0), len(data))     # 여기서 보여 준 출력은 process(output) 가 다시 보내지 않는다
     code = p.poll()
     state = "running" if code is None else f"exited {code}"
     return True, f"[{pid_id} {state}] sent {len(data)} chars\n" + (new[-4000:] or "(no new output yet)")
@@ -367,6 +405,25 @@ def bg_kill(ws: Path, pid_id: str) -> tuple[bool, str]:
     if v["proc"].poll() is None:
         _kill_tree(v["proc"])
     return True, f"{pid_id} stopped"
+
+
+def bg_take(ws: Path, pid_id: str) -> bytes:
+    """끝난 명령을 백그라운드 표에서 빼고 출력 전체를 돌려준다(run 이 기다리다 끝난 경우: 로그도 지운다)."""
+    v = _PROCS.get(f"{pid_id}@{ws}")
+    if not v:
+        return b""
+    try:
+        v["file"].close()
+    except OSError:
+        pass
+    data = v["log"].read_bytes()
+    try:
+        v["log"].unlink()
+    except OSError:                    # 손자 프로세스가 아직 파일을 쥐고 있으면(Windows) 그냥 둔다
+        pass
+    with _LOCK:
+        _PROCS.pop(f"{pid_id}@{ws}", None)
+    return data
 
 
 def bg_kill_all(ws: Path) -> None:
@@ -548,9 +605,11 @@ SEARCH_SCHEMA = _fn("web_search", "Search the web and return titles, links and s
 def web_schemas() -> list[dict]:
     """검색은 검색 API 가 설정됐을 때만 모델에게 보인다."""
     return [FETCH_SCHEMA] + ([SEARCH_SCHEMA] if search_backend() else [])
-PROCESS_SCHEMA = _fn("process", "Manage background commands started with run(background=true): "
-                     "action=list | output (needs id) | kill (needs id) | write (needs id and text: send input to the "
-                     "running program, e.g. answer a y/N prompt; Enter is added).",
+PROCESS_SCHEMA = _fn("process", "Manage background commands (run with background=true, or a run still going after "
+                     "its wait): action=list | output (needs id; returns only output that is new since you last looked, "
+                     "waiting up to `wait` seconds for some) | kill (needs id) | write (needs id and text: send input to "
+                     "the running program, e.g. answer a y/N prompt; Enter is added).",
                      {"action": {"type": "string", "enum": ["list", "output", "kill", "write"]}, "id": {"type": "string"},
-                      "text": {"type": "string"}},
+                      "text": {"type": "string"},
+                      "wait": {"type": "number", "description": "output: seconds to wait for new output (default 5, max 30)"}},
                      ["action"])

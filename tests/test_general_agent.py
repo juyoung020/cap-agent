@@ -51,9 +51,9 @@ def test_stale_overwrite_is_refused(ws):
     assert box.execute("write_file", {"path": "m.py", "content": FIXED})["ok"]
 
 
-def test_json_syntax_error_is_reported(ws):
+def test_json_syntax_error_is_refused(ws):
     r = ToolBox(ws).execute("write_file", {"path": "cfg.json", "content": '{"a": 1,}'})
-    assert r["ok"] and r["syntax_error"] and "문법" in r["output"]
+    assert not r["ok"] and "does not parse" in r["output"] and not (ws / "cfg.json").exists()
 
 
 def test_command_prefix_rules():
@@ -127,7 +127,7 @@ def test_unfinished_todos_are_asked_once(ws, monkeypatch):
 
 def test_unappliable_edit_is_returned_before_asking(ws, monkeypatch):
     seen = script(monkeypatch, [{"tool_calls": [call("edit_file", path="m.py", old="not in file", new="return 12345")]},
-                                {"content": "다시 읽어 볼게요."}])
+                                {"content": "다시 읽어 볼게요."}, {"content": "old 가 파일에 없었습니다."}])
     s, _ = session(ws, "ask")
     asked = []
     s.run_turn("고쳐", ask=lambda p: asked.append(p) or "y")

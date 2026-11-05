@@ -89,6 +89,94 @@ def expand_vars(v):
     return v
 
 
+SCHEMA_BUDGET = 2000         # MCP 도구 하나의 입력 스키마가 이 바이트를 넘으면 줄인다(16k 창)
+_SCHEMA_DROP = ("$schema", "examples", "title")
+_SCHEMA_NEST = ("items", "additionalProperties", "not", "contains", "prefixItems")
+
+
+def _schema_size(s: Any) -> int:
+    return len(json.dumps(s, ensure_ascii=False).encode("utf-8"))
+
+
+def _shrink(node: Any, depth: int, desc: int, max_depth: int) -> Any:
+    """스키마 노드 하나를 줄인다. depth: 객체가 겹친 깊이(맨 위 = 1). max_depth 보다 깊은 객체는 {"type": "object"}."""
+    if isinstance(node, list):
+        return [_shrink(x, depth, desc, max_depth) for x in node]
+    if not isinstance(node, dict):
+        return node
+    if (node.get("type") == "object" or "properties" in node) and depth > max_depth:
+        return {"type": "object"}
+    out: dict = {}
+    for k, v in node.items():
+        if k in _SCHEMA_DROP:
+            continue
+        if k == "description" and isinstance(v, str):
+            if desc > 0:
+                out[k] = v if len(v) <= desc else v[:desc - 1] + "…"
+        elif k in ("properties", "patternProperties", "$defs", "definitions") and isinstance(v, dict):
+            out[k] = {name: _shrink(sub, depth + 1, desc, max_depth) for name, sub in v.items()}   # 이름은 그대로
+        elif k in _SCHEMA_NEST and isinstance(v, (dict, list)):
+            out[k] = _shrink(v, depth + 1, desc, max_depth)
+        elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
+            out[k] = _shrink(v, depth, desc, max_depth)
+        else:
+            out[k] = v
+    return out
+
+
+def _refs(node: Any, acc: set) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "$ref" and isinstance(v, str):
+                acc.add(v)
+            else:
+                _refs(v, acc)
+    elif isinstance(node, list):
+        for x in node:
+            _refs(x, acc)
+
+
+def _prune_defs(s: dict) -> None:
+    """맨 위 $defs·definitions 중 어디서도($defs 안의 참조를 거쳐서도) 가리키지 않는 것을 버린다."""
+    for key in ("$defs", "definitions"):
+        defs = s.get(key)
+        if not isinstance(defs, dict):
+            continue
+        refs: set = set()
+        _refs({k: v for k, v in s.items() if k not in ("$defs", "definitions")}, refs)
+        keep: set = set()
+        grew = True
+        while grew:
+            grew = False
+            for name, d in defs.items():
+                if name not in keep and f"#/{key}/{name}" in refs:
+                    keep.add(name)
+                    _refs(d, refs)
+                    grew = True
+        if keep:
+            s[key] = {n: d for n, d in defs.items() if n in keep}
+        else:
+            s.pop(key)
+
+
+def compact_schema(schema: dict, budget: int = SCHEMA_BUDGET) -> dict:
+    """큰 입력 스키마를 줄인다: $schema·examples·title 빼기, 설명 80자, 안 쓰는 $defs 빼기, 3단보다 깊은 객체 접기.
+    그래도 크면 더 세게(설명 40자 → 없음, 2단 → 1단). 맨 위 속성 이름과 required 는 늘 남긴다. 작으면 그대로."""
+    if not isinstance(schema, dict) or _schema_size(schema) <= budget:
+        return schema
+    for desc, depth in ((80, 3), (40, 3), (40, 2), (0, 2), (0, 1)):
+        out = _shrink(schema, 1, desc, depth)
+        _prune_defs(out)
+        if _schema_size(out) <= budget:
+            return out
+    props = {n: ({"type": p["type"]} if isinstance(p, dict) and isinstance(p.get("type"), (str, list)) else {})
+             for n, p in (schema.get("properties") or {}).items()}
+    out = {"type": "object", "properties": props}
+    if schema.get("required"):
+        out["required"] = schema["required"]
+    return out
+
+
 def tool_name(server: str, tool: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", f"mcp__{server}__{tool}")[:64]
 
@@ -194,6 +282,7 @@ class MCPManager:
                         schema = dict(schema) if isinstance(schema, dict) else {}
                         schema.setdefault("type", "object")
                         schema.setdefault("properties", {})
+                        schema = compact_schema(schema)
                         n = tool_name(name, t.name)
                         self.tools[n] = {"server": name, "tool": t.name, "schema": {"type": "function", "function": {
                             "name": n, "description": f"[MCP {name}] {(t.description or '')}"[:1000], "parameters": schema}}}
@@ -268,7 +357,7 @@ class MCPManager:
         for c in getattr(res, "contents", None) or []:
             txt = getattr(c, "text", None)
             parts.append(txt if txt is not None else f"[binary {getattr(c, 'mime_type', '') or 'data'} not shown]")
-        return True, ("\n".join(parts) or "(empty)")[:OUT_MAX]
+        return True, "\n".join(parts) or "(empty)"      # 원문 그대로(부르는 쪽이 tools.spill)
 
     # -- 프롬프트(Claude Code 처럼 /mcp__서버__이름 인자… 로 부른다)
     def get_prompt(self, cmd: str, rest: str) -> tuple[bool, str]:
@@ -325,7 +414,7 @@ class MCPManager:
             parts.append(txt if txt is not None else f"[{getattr(c, 'type', 'content')} not shown]")
         err = bool(getattr(res, "is_error", None) or getattr(res, "isError", None))
         out = "\n".join(parts) or "(no output)"
-        return not err, out[:OUT_MAX]
+        return not err, out           # 원문 그대로 — 루프가 tools.spill 로 머리·꼬리만 남기고 전체는 파일로
 
     def _save_image(self, c) -> str:
         import base64

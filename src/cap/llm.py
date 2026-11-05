@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import os
@@ -22,12 +23,18 @@ NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 def set_thinking(on: bool) -> None:
-    """/think: 모델의 생각(추론) 모드. 켜면 느리지만 어려운 문제에 낫다. 생각 내용은 답에서 뺀다."""
+    """/think: 모델의 생각(추론) 모드. 켜면 느리지만 어려운 문제에 낫다. 생각 내용은 답에서 뺀다.
+    요약·심판 같은 보조 호출은 think=False 로 늘 끈다(작은 모델이 생각만 하다 빈 답을 내므로)."""
     NO_THINK["chat_template_kwargs"]["enable_thinking"] = bool(on)
 
 
 def thinking() -> bool:
     return bool(NO_THINK["chat_template_kwargs"]["enable_thinking"])
+
+
+def think_body(think: bool | None = None) -> dict:
+    """이번 호출의 extra_body: think 가 None 이면 전역 /think 설정을 따른다."""
+    return {"chat_template_kwargs": {"enable_thinking": thinking() if think is None else bool(think)}}
 
 STATS = {"calls": 0, "seconds": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
 # 추정 보정 배율: 실제 prompt_tokens / 추정 의 최댓값(실측: 코드가 많은 대화는 문자수/3 추정보다 ~17% 많음)
@@ -139,6 +146,67 @@ RATE_LIMIT_RETRIES = int(os.getenv("CAP_RATE_LIMIT_RETRIES", "10"))
 
 def is_rate_limited(msg: str) -> bool:
     return bool(re.search(r"\b429\b|too many requests|rate.?limit|\b503\b|service unavailable", msg or "", re.I))
+
+
+TRANSIENT = ("context", "rate_limited", "other", "unreachable")   # 다시 해 볼 만한 오류(/continue 안내)
+
+
+class ModelCallError(RuntimeError):
+    """모델 호출 실패. kind: classify_error 의 분류."""
+
+    def __init__(self, msg: str, kind: str = "other"):
+        super().__init__(msg)
+        self.kind = kind
+
+
+def classify_error(msg: str) -> str:
+    """호출 오류 → auth · model_not_found · unreachable · context · rate_limited · other."""
+    m = msg or ""
+    if "maximum context length" in m or "context length" in m:
+        return "context"
+    if is_rate_limited(m):
+        return "rate_limited"
+    if re.search(r"\b40[13]\b|unauthori[sz]ed|forbidden|invalid.{0,12}api.?key|incorrect api key|"
+                 r"authentication|no api key", m, re.I):
+        return "auth"
+    if re.search(r"\b404\b|model_not_found|model .{0,80}(does not exist|not found)|no such model|unknown model", m, re.I):
+        return "model_not_found"
+    if re.search(r"connection (error|refused|reset)|failed to establish|connect(ion)? ?error|"
+                 r"name or service not known|getaddrinfo|nodename nor servname|actively refused|unreachable", m, re.I):
+        return "unreachable"
+    return "other"
+
+
+def error_hint(exc: BaseException) -> str:
+    """화면의 오류 줄 뒤에 붙일 말: 다시 해 볼 만한 오류에만 /continue."""
+    kind = getattr(exc, "kind", None) or classify_error(str(exc))
+    return "  (session kept — /continue retries from the last step)" if kind in TRANSIENT else "  (session kept)"
+
+
+def _guidance(kind: str, err: str) -> str:
+    """고칠 방법을 앞에 둔 오류문."""
+    name = PROVIDER.get("name", "")
+    env = PROVIDER.get("env_key") or ("KAU_API_KEY" if name == "kau" else "")
+    if kind == "auth" and "no api key" in err.lower():          # 키가 아예 없음: 그 문장이 이미 방법을 말한다
+        return f"모델 호출 실패: {err}"
+    if kind == "auth":
+        fix = f"the key was rejected — run `cap setup` or set {env}" if env else "the key was rejected — run `cap setup`"
+    elif kind == "model_not_found":
+        fix = f"model {MODEL} was not found on provider {name} — pick another with `cap setup` or CAP_MODEL"
+        try:
+            from .setup import list_models
+            names = list_models(timeout=5.0)
+        except Exception:  # noqa: BLE001
+            names = []
+        if names:
+            fix += f" (available: {', '.join(names[:6])})"
+    elif kind == "unreachable":
+        local = {"ollama": "Ollama", "lmstudio": "LM Studio"}.get(name)
+        fix = (f"cannot reach {BASE_URL} — is {local} running?" if local
+               else f"cannot reach {BASE_URL} — check the network or the provider's base_url")
+    else:
+        return f"모델 호출 실패: {err}"
+    return f"모델 호출 실패: {fix}. ({err[:200]})"
 
 
 def _short_error(msg: str) -> str:
@@ -356,12 +424,44 @@ def fit_budget(messages: list[dict[str, Any]], tools: list[dict] | None, max_tok
 
 # ---------------------------------------------------------------- 호출
 
-def _stream_call(kwargs: dict, on_text: Callable[[str], None]) -> Any:
+REPEAT_MIN_CHARS = 25        # 이 길이 이상인 같은 문장이
+REPEAT_TIMES = 3             # 이만큼 나오면 되풀이로 본다(9B 가 같은 문장을 출력 한도까지 반복 — 실측 157초)
+
+
+def repeating(text: str) -> bool:
+    """같은 문장(REPEAT_MIN_CHARS 자 이상)이 REPEAT_TIMES 번 나왔나. 아직 끝나지 않은 마지막 문장은 세지 않는다."""
+    pieces = re.split(r"(?<=[.!?。])\s+|\n+", text or "")
+    if not re.search(r"[.!?。\n]\s*$", text or ""):
+        pieces = pieces[:-1]
+    seen: dict[str, int] = {}
+    for p in pieces:
+        s = " ".join(p.split())
+        if len(s) < REPEAT_MIN_CHARS or not re.search(r"\w{3}", s):
+            continue
+        seen[s] = seen.get(s, 0) + 1
+        if seen[s] >= REPEAT_TIMES:
+            return True
+    return False
+
+
+def _reasoning(obj: Any) -> str:
+    """메시지·조각의 생각 글(reasoning_content 또는 reasoning — 서버마다 이름이 다르다)."""
+    extra = getattr(obj, "model_extra", None) or {}
+    for k in ("reasoning_content", "reasoning"):
+        v = getattr(obj, k, None) or (extra.get(k) if isinstance(extra, dict) else None)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def _stream_call(kwargs: dict, on_text: Callable[[str], None],
+                 stop_on: Callable[[str], bool] | None = None) -> Any:
     """스트리밍 호출: 글자가 오는 대로 on_text(지금까지의 본문)를 부르고, 끝나면 비스트리밍 응답과 같은 모양으로 돌려준다.
-    도구 호출 조각은 index 별로 이어 붙인다(수업 서버 vLLM 은 스트리밍에서도 tool_calls 를 준다 — 실측)."""
+    도구 호출 조각은 index 별로 이어 붙인다(수업 서버 vLLM 은 스트리밍에서도 tool_calls 를 준다 — 실측).
+    stop_on(본문) 이 참이면 스트림을 닫고 finish_reason="repetition" 으로 돌려준다."""
     from types import SimpleNamespace as NS
     stream = client().chat.completions.create(**kwargs, stream=True, stream_options={"include_usage": True})
-    content, calls, finish, usage, last = "", {}, None, {}, 0.0
+    content, reasoning, calls, finish, usage, last = "", "", {}, None, {}, 0.0
     for ch in stream:
         if getattr(threading.current_thread(), "cap_abandoned", False):   # 대화창에서 중단: 더 읽지 않는다
             stream.close()
@@ -371,12 +471,18 @@ def _stream_call(kwargs: dict, on_text: Callable[[str], None]) -> Any:
         if not ch.choices:
             continue
         d = ch.choices[0].delta
+        reasoning += _reasoning(d)
         if d.content:
             content += d.content
             now = time.perf_counter()
             if now - last > 0.08:
                 last = now
                 on_text(content)
+            if stop_on is not None and re.search(r"[.!?。\n]", d.content) and stop_on(content):
+                with contextlib.suppress(Exception):
+                    stream.close()
+                finish = "repetition"
+                break
         for tc in d.tool_calls or []:
             c = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
             c["id"] = tc.id or c["id"]
@@ -388,7 +494,8 @@ def _stream_call(kwargs: dict, on_text: Callable[[str], None]) -> Any:
         on_text(content)
     tcs = [NS(id=c["id"] or f"call_{k}", function=NS(name=c["name"], arguments=c["args"] or "{}"))
            for k, c in sorted(calls.items()) if c["name"]]
-    return NS(choices=[NS(message=NS(content=content, tool_calls=tcs), finish_reason=finish)],
+    return NS(choices=[NS(message=NS(content=content, tool_calls=tcs, reasoning_content=reasoning),
+                          finish_reason=finish)],
               usage=NS(model_dump=lambda: usage) if usage else None)
 
 
@@ -396,14 +503,18 @@ def chat(messages: list[dict[str, Any]], *, tools: list[dict] | None = None,
          max_tokens: int = 1024, temperature: float = 0.1,
          response_format: dict | None = None, ledger=None, tag: str = "",
          on_text: Callable[[str], None] | None = None,
-         on_overflow: Callable[[list], list] | None = None) -> dict[str, Any]:
+         on_overflow: Callable[[list], list] | None = None,
+         think: bool | None = None,
+         stop_on: Callable[[str], bool] | None = None) -> dict[str, Any]:
     """모델 호출. 반환: {content, tool_calls, finish_reason, usage, budget_actions}. on_text 를 주면 스트리밍.
-    on_overflow: 서버가 맥락 초과로 거절하면 원래 메시지를 받아 줄인 메시지를 돌려주는 함수(예: 요약 압축)."""
+    on_overflow: 서버가 맥락 초과로 거절하면 원래 메시지를 받아 줄인 메시지를 돌려주는 함수(예: 요약 압축).
+    think: 이번 호출의 생각 모드(None = /think 설정). 보조 호출(요약·심판)은 False.
+    stop_on: 스트리밍 중 본문을 받아 참이면 끊는다(finish_reason="repetition")."""
     msgs, max_tokens, actions = fit_budget(messages, tools, max_tokens)
     msgs = with_images(msgs)
     kwargs: dict[str, Any] = dict(model=MODEL, messages=msgs, max_tokens=max_tokens,
                                   temperature=temperature,
-                                  **({"extra_body": NO_THINK} if PROVIDER.get("thinking_param") else {}))
+                                  **({"extra_body": think_body(think)} if PROVIDER.get("thinking_param") else {}))
     if tools:
         kwargs["tools"] = tools
         kwargs["parallel_tool_calls"] = True
@@ -414,7 +525,8 @@ def chat(messages: list[dict[str, Any]], *, tools: list[dict] | None = None,
     while True:
         t0 = time.perf_counter()
         try:
-            resp = _stream_call(kwargs, on_text) if on_text else client().chat.completions.create(**kwargs)
+            resp = (_stream_call(kwargs, on_text, stop_on) if on_text
+                    else client().chat.completions.create(**kwargs))
             dt = time.perf_counter() - t0
             break
         except Exception as exc:  # noqa: BLE001
@@ -425,21 +537,25 @@ def chat(messages: list[dict[str, Any]], *, tools: list[dict] | None = None,
             if getattr(threading.current_thread(), "cap_abandoned", False):   # 대화창에서 중단한 호출: 재시도 없이 끝
                 raise RuntimeError("중단됨")
             STATS["seconds"] += dt
-            busy = is_rate_limited(msg)
+            kind = classify_error(msg)
+            busy = kind == "rate_limited"
             if ledger:
-                ledger.log("llm_error", tag=tag, error=msg[:500], seconds=round(dt, 2), rate_limited=busy)
+                ledger.log("llm_error", tag=tag, error=msg[:500], seconds=round(dt, 2), rate_limited=busy, kind=kind)
             attempt += 1
+            if kind in ("auth", "model_not_found", "unreachable"):
+                # 다시 해도 같은 결과: 키 거절·없는 모델·서버 안 뜸(SDK 가 연결 재시도는 이미 함). 고칠 방법을 알려 준다
+                raise ModelCallError(_guidance(kind, msg), kind)
             if busy:
                 # 공유 서버의 동시 요청 제한(nginx 429): 짧게 2·4초 쉬고 포기하면 실행 전체가 죽는다(도그푸딩 실측).
                 # 길게 물러나며 더 여러 번 기다린다.
                 attempts = RATE_LIMIT_RETRIES
                 if attempt >= attempts:
-                    raise RuntimeError(f"모델 호출 실패(서버 혼잡, {attempt}회 대기 후 포기): {last_err}")
+                    raise ModelCallError(f"모델 호출 실패(서버 혼잡, {attempt}회 대기 후 포기): {last_err}", kind)
                 time.sleep(min(60.0, 3.0 * 2 ** min(attempt, 5)))
                 continue
             if attempt >= attempts:
-                raise RuntimeError(f"모델 호출 실패: {last_err}")
-            if "maximum context length" in msg or "context length" in msg:
+                raise ModelCallError(f"모델 호출 실패: {last_err}", kind)
+            if kind == "context":
                 # 추정이 빗나간 경우: 추정을 바로잡고, 요약 압축(on_overflow)이 있으면 그것으로, 없으면 최근 것만 남겨 다시
                 learn_from_overflow(msg, kwargs["messages"], tools)
                 if ledger:
@@ -476,6 +592,9 @@ def chat(messages: list[dict[str, Any]], *, tools: list[dict] | None = None,
     if "<think>" in content or "</think>" in content:
         content = re.sub(r"(?s)^.*?</think>", "", content) if "</think>" in content else content
         content = re.sub(r"(?s)<think>.*?(</think>|$)", "", content).strip()
+    if not tools and not content.strip():
+        # 도구 없는 호출(요약·심판)인데 본문이 비었다: 생각만 하고 끝난 모델 — 생각 글을 답으로 쓴다
+        content = _reasoning(msg).strip()
     if tools and not tool_calls and "<tool_call>" in content:
         tool_calls = parse_leaked_tool_calls(content)
         if tool_calls:
@@ -491,11 +610,12 @@ def chat(messages: list[dict[str, Any]], *, tools: list[dict] | None = None,
 
 
 def chat_json(messages: list[dict[str, Any]], schema: dict, *, name: str = "out",
-              max_tokens: int = 1500, ledger=None, tag: str = "") -> dict:
+              max_tokens: int = 1500, ledger=None, tag: str = "", think: bool | None = None) -> dict:
     """json_schema 강제 출력. 형식은 서버가, 판단은 코드가."""
     rf = {"type": "json_schema", "json_schema": {"name": name, "schema": schema, "strict": True}}
     for _ in range(2):
-        r = chat(messages, max_tokens=max_tokens, temperature=0.1, response_format=rf, ledger=ledger, tag=tag)
+        r = chat(messages, max_tokens=max_tokens, temperature=0.1, response_format=rf, ledger=ledger, tag=tag,
+                 think=think)
         txt = r["content"].strip()
         try:
             return json.loads(txt)

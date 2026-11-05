@@ -88,7 +88,8 @@ graph TD;
 	tools -.-> agent;
 	tools -.-> escalate;
 	tools -.-> subagent;
-	validate --> permission;
+	validate -.-> escalate;
+	validate -.-> permission;
 	verify_gate -.-> __end__;
 	verify_gate -.-> agent;
 	verify_gate -.-> escalate;
@@ -101,9 +102,9 @@ graph TD;
 
 ## Status
 
-- Measured on Windows 11 with `qwen3.5-9b` (16k context): small bug-fix tasks pass; on harder multi-file tasks a 9B model succeeds about 2 times in 7. Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
+- Measured on Windows 11 with `qwen3.5-9b` (16k context): small bug-fix tasks pass; the earlier multi-file result (2 of 7) was measured on a task whose own test was wrong and is being re-measured. Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
 - Other providers were tested against a fake OpenAI-compatible server, not with real keys.
-- 388 tests: `python -m pytest -q tests` (no API calls).
+- 469 tests: `python -m pytest -q tests` (no API calls).
 
 ## License
 

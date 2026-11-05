@@ -28,10 +28,10 @@ from langgraph.types import Command
 from . import compact as cmp
 from . import llm
 from .evalcheck import collect_test_files
-from .loop import build_loop
+from .loop import build_loop, fail_signature
 from .policy import APPROVAL_HELP, BYPASS_WARNING, MODE_TABLE, classify_command, is_secret_path, normalize_mode
 from .store import Ledger, Shadow, cap_dir, file_hash, iter_files, now_id, rel
-from .tools import run_shell
+from .tools import run_shell, spill
 
 # Codex(AGENTS.md, AGENTS.override.md)·Claude Code(CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md)·CAP 의 지침 파일
 INSTRUCTION_FILES = ("AGENTS.override.md", "AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md",
@@ -41,6 +41,7 @@ INSTRUCTIONS_MAX = 4000      # Codex 12 §7 표: AGENTS.md 상한 4 KiB(9B·16k)
 RECURSION = 500              # 사용자 턴 하나에 도구 라운드(노드 5개) × 최대 30턴 + 검증
 SUBAGENT_CONCURRENCY = 2     # 하위 에이전트 동시 실행 수(수업 서버 한 대 — Codex 09 §14-3)
 GOAL_MAX_TURNS = 8           # /goal 턴 예산(Hermes 기본 20, 9B·느린 서버라 줄임)
+GOAL_SAME_LIMIT = 3          # /goal: 파일 변경 없이 같은 결과로 끝난 턴이 연속 3번이면 멈춤
 GOAL_JUDGE = ("You judge whether a coding agent has reached the user's goal. done = the reply shows the goal is "
               "achieved with concrete evidence (changed code, test results); explaining why it cannot be done is NOT "
               "done. blocked = impossible, out of scope, or the next step needs the user. continue = there is a next "
@@ -163,9 +164,10 @@ class UI:
                         lines.append(self.dim(f"      … +{len(dl) - 8} lines"))
             if res.get("syntax_error"):
                 lines.append(self.red("      ⚠ syntax error after edit — sent back to the model"))
-        elif name == "run" and args.get("background"):
+        elif name == "run" and (args.get("background") or res.get("background")):
             cmd = " ".join(args.get("cmd", "").split())
-            lines.append(bullet + f"run {cmd[:90]} → started in background")
+            lines.append(bullet + f"run {cmd[:90]} → " + (f"still running in background as {res['background']}"
+                                                          if res.get("background") else "started in background"))
         elif name == "run":
             cmd = " ".join(args.get("cmd", "").split())
             code = res.get("exit")
@@ -425,6 +427,7 @@ class ChatSession:
         self.approval = {"mode": normalize_mode(approval)}
         self.test_cmd = detect_test_cmd(ws)
         self.inst_names, inst_text = load_instructions(ws)
+        self.facts = self._facts(self.test_cmd, self.inst_names, inst_text)
         if not meta:
             meta = {"sid": self.sid, "started": _dt.datetime.now().isoformat(timespec="seconds"), "title": "",
                     "turns": 0, "start_sha": Shadow(ws).snapshot("session start")}
@@ -440,31 +443,66 @@ class ChatSession:
         self._ask_lock = threading.Lock()      # 하위 에이전트 여럿이 동시에 승인을 묻지 않게
         self.current_ask = self.ask_approval
         from .hooks import Hooks
-        from .memory import memory_block, skills_block
         self.hooks = Hooks(ws)
         from .extras import load_rules
         self.rules = load_rules(ws)
         from .mcp_client import MCPManager
         self.mcp = MCPManager(ws)
-        extra = [workspace_block(ws, self.test_cmd, self.inst_names, inst_text), memory_block(ws), skills_block(ws)]
+        self.hook_context = ""
         if self.hooks.any("SessionStart"):
             hr = self.hooks.run("SessionStart", {"source": "resume" if sid else "startup", "session_id": self.sid})
-            if hr["context"]:
-                extra.append("Context from a SessionStart hook:\n" + hr["context"])
-        self.system_extra = "\n\n".join(x for x in extra if x)
+            self.hook_context = hr["context"] or ""
+        self.system_extra = self._system_extra(inst_text)
         self.saver, self.conn = checkpointer(ws)
         self.ledger = Ledger(ws, f"chat-{self.sid}")
-        from .trust import project_approvals
-        self.app = build_loop(ws=ws, ledger=self.ledger, test_cmd=self.test_cmd, frozen=set(),
-                              preapproved=set(project_approvals(ws)),
-                              decisions=[], printer=self.ui.out, checkpointer=self.saver, mode="chat",
-                              approval=self.approval, ui=self.ui, steer=self.take_steer,
-                              ask_human=self._ask_human, should_stop=self.cancel_event.is_set,
-                              hooks=self.hooks, mcp=self.mcp if self.mcp.tools else None, rules=self.rules,
-                              system_extra=self.system_extra)
+        self.app = self._build()
         self.cfg = {"configurable": {"thread_id": f"chat-{self.sid}"}, "recursion_limit": RECURSION,
                     "max_concurrency": SUBAGENT_CONCURRENCY}
         self.turn_mode: str | None = None     # 다음 한 턴만 쓸 모드(/review 는 읽기 전용)
+
+    @staticmethod
+    def _facts(test_cmd: str, names: list[str], inst_text: str) -> tuple[str, str]:
+        import hashlib
+        return test_cmd, hashlib.sha1(("\n".join(names) + "\0" + inst_text).encode("utf-8", "replace")).hexdigest()
+
+    def _system_extra(self, inst_text: str) -> str:
+        from .memory import memory_block, skills_block
+        extra = [workspace_block(self.ws, self.test_cmd, self.inst_names, inst_text), memory_block(self.ws),
+                 skills_block(self.ws)]
+        if self.hook_context:
+            extra.append("Context from a SessionStart hook:\n" + self.hook_context)
+        return "\n\n".join(x for x in extra if x)
+
+    def _build(self, facts_note: str = ""):
+        """코딩 루프 그래프. 상태는 SQLite 체크포인터에 있으므로 다시 만들어도 대화는 그대로 이어진다."""
+        from .trust import project_approvals
+        return build_loop(ws=self.ws, ledger=self.ledger, test_cmd=self.test_cmd, frozen=set(),
+                          preapproved=set(project_approvals(self.ws)),
+                          decisions=[], printer=self.ui.out, checkpointer=self.saver, mode="chat",
+                          approval=self.approval, ui=self.ui, steer=self.take_steer,
+                          ask_human=self._ask_human, should_stop=self.cancel_event.is_set,
+                          hooks=self.hooks, mcp=self.mcp if self.mcp.tools else None, rules=self.rules,
+                          system_extra=self.system_extra, facts_note=facts_note)
+
+    def refresh_facts(self) -> str:
+        """매 턴: 테스트 명령과 지침 파일을 다시 읽는다. 바뀌었으면(모델이 첫 테스트를 만들었거나 /init 이 AGENTS.md 를 썼다)
+        시스템 글과 루프를 새로 만들고, 다음 요청 앞에 붙일 한 줄을 돌려준다(그대로면 '')."""
+        test_cmd = detect_test_cmd(self.ws)
+        names, inst_text = load_instructions(self.ws)
+        facts = self._facts(test_cmd, names, inst_text)
+        if facts == self.facts:
+            return ""
+        changes = []
+        if facts[0] != self.facts[0]:
+            changes.append(f"tests: {test_cmd or '(none)'}")
+        if facts[1] != self.facts[1]:
+            changes.append("instructions updated" + (f" ({', '.join(names)})" if names else " (none now)"))
+        self.facts, self.test_cmd, self.inst_names = facts, test_cmd, names
+        self.system_extra = self._system_extra(inst_text)
+        note = "[Project facts changed] " + " / ".join(changes)
+        self.app = self._build(note)
+        self.ledger.log("facts_changed", test_cmd=test_cmd, instructions=names)
+        return note
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -502,6 +540,7 @@ class ChatSession:
             if server not in self.mcp.resources:
                 continue
             ok, body = self.mcp.read_resource(server, uri)
+            body = spill(self.ws, body)
             out.append(f"--- @{server}:{uri} (MCP resource) ---\n" + (body if ok else f"(could not read: {body})"))
         return out
 
@@ -525,6 +564,7 @@ class ChatSession:
         self.current_ask = ask
         self.cancel_event.clear()
         t0, calls0 = time.perf_counter(), llm.STATS["calls"]
+        self.refresh_facts()
         if text is not None:
             if not self.meta.get("title"):
                 self.meta["title"] = text[:60]
@@ -555,6 +595,7 @@ class ChatSession:
         finally:
             if mode:
                 self.approval["mode"] = prev
+        self.refresh_facts()                 # 이번 턴에 생긴 테스트·지침을 /goal 관문과 다음 턴이 보게
         v = self.values()
         self.meta["turns"] = v.get("turn_no", 0)
         self.meta["calls"] = self.meta.get("calls", 0) + llm.STATS["calls"] - calls0
@@ -713,6 +754,16 @@ class ChatSession:
         msg = (f"[Goal] {objective}\nWork toward this goal step by step. When it is fully done and verified, say so and "
                "stop. If you are blocked and need the user, say exactly why and stop.")
         bad_judge, gate_fail = 0, 0
+        last_sig, same = None, 0
+
+        def stalled(changed: list, sig: str) -> bool:
+            """파일을 안 바꾸고 같은 결과로 끝난 턴이 3번 연속이면 진전 없음(남은 턴을 다 태우지 않는다)."""
+            nonlocal last_sig, same
+            key = (tuple(sorted(changed)), sig)
+            same = same + 1 if (not changed and key == last_sig) else (1 if not changed else 0)
+            last_sig = key
+            return same >= GOAL_SAME_LIMIT
+
         for k in range(1, max_turns + 1):
             if self.cancel_event.is_set():
                 return "goal stopped by the user"
@@ -723,11 +774,16 @@ class ChatSession:
             v = r["values"]
             if v.get("status") in ("escalated", "blocked"):
                 return f"goal stopped: {v.get('status')} — {(v.get('verify_note') or v.get('escalate_reason') or '')[:200]}"
-            if self.test_cmd:
-                code, out = run_shell(self.test_cmd, self.ws, timeout=300)
+            if self.test_cmd:      # 관문도 모델의 명령과 같은 격리 안에서(bypass 만 격리 없음)
+                from . import sandbox as sbx
+                sb = "" if normalize_mode(self.approval["mode"]) == "bypass" else sbx.backend()
+                code, out = run_shell(self.test_cmd, self.ws, timeout=300, sandbox=sb)
                 if code not in (0, 5):
                     gate_fail += 1
                     note(f"◎ Gate: {self.test_cmd} failed (attempt {gate_fail})")
+                    if stalled(v.get("turn_changed") or [], fail_signature(re.sub(r"\d+\.\d+s", "", out))):
+                        return (f"goal blocked: no progress ({same} turns in a row changed no files and "
+                                f"`{self.test_cmd}` failed the same way)")
                     msg = (f"[Continuing toward your goal] {objective}\nThe quality gate `{self.test_cmd}` must pass before the "
                            f"goal can be called done, and it just failed (exit {code}):\n{out[-3000:]}\nFix the root cause, "
                            "then run the tests to confirm. Do not claim the goal is done while the gate fails. If the gate "
@@ -738,7 +794,8 @@ class ChatSession:
                 j = llm.chat_json([{"role": "system", "content": GOAL_JUDGE},
                                    {"role": "user", "content": f"Goal: {objective}\n\nAgent's latest reply:\n{answer[:3000]}\n\n"
                                                                f"Quality gate: {'passed' if self.test_cmd else 'none'}"}],
-                                  GOAL_SCHEMA, name="verdict", max_tokens=200, ledger=self.ledger, tag="goal_judge")
+                                  GOAL_SCHEMA, name="verdict", max_tokens=200, ledger=self.ledger, tag="goal_judge",
+                                  think=False)
                 verdict, reason = j.get("verdict"), str(j.get("reason", ""))[:200]
                 bad_judge = 0
             except (RuntimeError, ValueError, AttributeError):
@@ -752,6 +809,8 @@ class ChatSession:
                 return f"goal done in {k} turn(s): {reason}"
             if verdict == "blocked":
                 return f"goal blocked: {reason}"
+            if stalled(v.get("turn_changed") or [], "judge:continue"):
+                return f"goal blocked: no progress ({same} turns in a row changed no files; judge: {reason})"
             msg = (f"[Continuing toward your goal] {objective}\nDo the next concrete step (judge: {reason}). If it is done, "
                    "say so and stop. If you are blocked and need the user, say so clearly and stop.")
         return f"goal not finished after {max_turns} turns"
@@ -765,7 +824,7 @@ class ChatSession:
         msgs = cmp.shrink_old(cmp.normalize(msgs))
         try:
             r = llm.chat(msgs + [{"role": "user", "content": M.LEARN_PROMPT}], max_tokens=400, temperature=0.1,
-                         ledger=self.ledger, tag="learn")
+                         ledger=self.ledger, tag="learn", think=False)
             text = r["content"] or ""
             facts = json.loads(text[text.find("{"): text.rfind("}") + 1]).get("facts") or []
         except (RuntimeError, ValueError, AttributeError):
@@ -853,7 +912,7 @@ class ChatSession:
             bar = "█" * min(30, n * 30 // max(win, 1))
             out.append(f"  {k:<46} ~{n:>6,}  {bar}")
         out.append(f"  {'free':<46} ~{max(win - total, 0):>6,}")
-        out.append(f"Auto-compacts at ~{cmp.COMPACT_AT:,} tokens; /compact to do it now.")
+        out.append(f"Auto-compacts at ~{cmp.compact_at():,} tokens; /compact to do it now.")
         return out
 
     def compact(self, focus: str = "") -> str:
@@ -1035,7 +1094,7 @@ def _turn(s: ChatSession, text: str | None) -> None:
     except KeyboardInterrupt:
         s.ui.out(s.ui.dim("\n■ Interrupted · tell CAP what to do instead"))
     except RuntimeError as exc:
-        s.ui.out(s.ui.red(f"Error: {llm.scrub(str(exc))[:300]}") + "  (session kept — /continue retries from the last step)")
+        s.ui.out(s.ui.red(f"Error: {llm.scrub(str(exc))[:300]}") + llm.error_hint(exc))
 
 
 def _pick_session(ws: Path, arg: str) -> str | None:
@@ -1250,7 +1309,7 @@ def attach_mentions(ws: Path, text: str) -> list[str]:
 def doctor_lines(ws: Path, test_cmd: str | None = None, ping: bool = True) -> list[str]:
     """시작 점검(NVIDIA apply §5.3 스모크): 키·서버·모델·git·bash·테스트 명령·.cap 쓰기."""
     import shutil
-    from .tools import find_bash
+    from .tools import find_bash, python_note
     out = []
 
     def line(ok: bool | None, what: str, detail: str) -> None:
@@ -1272,6 +1331,7 @@ def doctor_lines(ws: Path, test_cmd: str | None = None, ping: bool = True) -> li
     line(bool(shutil.which("git")), "git", shutil.which("git") or "not found — /undo and /diff need git")
     b = find_bash()
     line(bool(b) or None, "bash", b or "not found — commands run in the system shell")
+    line(True, "python", python_note(ws))
     tc = test_cmd if test_cmd is not None else detect_test_cmd(ws)
     line(bool(tc) or None, "tests", tc or "no test command found — changes cannot be verified")
     from . import sandbox as sbx

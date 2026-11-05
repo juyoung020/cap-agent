@@ -20,8 +20,16 @@ from pathlib import Path
 from . import llm
 
 # 16k 창에서 한 턴 안에 도구 출력이 5~8k 토큰 붙으므로 턴 시작 시점 기준은 창의 절반으로 둔다.
-COMPACT_AT = int(llm.CONTEXT_WINDOW * 0.5)
+# 창 크기는 공급자를 고른 뒤에야 정해지므로(import 시점엔 기본 16k) 읽을 때마다 compact_at() 으로 계산한다.
+COMPACT_AT: int | None = None      # 정수를 넣으면 그 값으로 고정(시험·실험용)
 OLD_TOOL_KEEP = 300
+PRUNE_OVER = 400                   # prune_turn: 이보다 긴 도구 출력만 한 줄로 줄인다
+PRUNE_FAIL_KEEP = 300              # 실패한 도구 출력은 앞부분을 이만큼 남긴다
+
+
+def compact_at() -> int:
+    """턴 시작 압축 기준(토큰): COMPACT_AT 을 넣었으면 그 값, 아니면 지금 창의 절반."""
+    return COMPACT_AT if COMPACT_AT is not None else int(llm.CONTEXT_WINDOW * 0.5)
 ABORTED = "aborted: 사용자가 턴을 중단해서 이 호출은 실행되지 않았다"
 
 SUMMARY_PROMPT = """[CONTEXT CHECKPOINT] 지금까지의 대화를 다른 모델이 이어받을 수 있게 요약해라. 도구를 부르지 말고 글로만.
@@ -93,6 +101,69 @@ def shrink_old(msgs: list[dict]) -> list[dict]:
     return out
 
 
+_DATA_WRAP = re.compile(r"\A(<data source=\"[^\"]*\">\n)(.*)(\n</data>)\Z", re.S)
+
+
+def _prune_one(name: str, args: dict, body: str) -> str:
+    """이번 턴의 오래된 도구 출력 하나를 한 줄로(실패 출력은 앞부분만)."""
+    first = body.split("\n", 1)[0]
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    last = lines[-1][:200] if lines else ""
+    if name == "read_file":
+        m = re.match(r"\[(.+?) 줄 (\d+)-(\d+) / 전체 (\d+)\]", first)
+        where = (f"{m.group(1)} lines {m.group(2)}-{m.group(3)} of {m.group(4)}" if m
+                 else str(args.get("path", "")))
+        return f"[pruned] read_file {where} ({len(body)} chars) — content removed to save context; read it again if needed."
+    if name in ("run", "run_tests"):
+        m = re.match(r"\[(?:(.*) → )?exit (-?\d+)\]", first)
+        cmd = (m.group(1) if m and m.group(1) else "") or str(args.get("cmd") or args.get("target") or name)
+        code = m.group(2) if m else "?"
+        return f"[pruned] {name} `{cmd[:200]}` → exit {code} ({len(body)} chars); last line: {last}"
+    if name == "search":
+        return (f"[pruned] search `{str(args.get('pattern', ''))[:120]}` in {args.get('path') or '.'} → "
+                f"{len(lines)} matching lines (output removed; search again if needed)")
+    if name in ("edit_file", "write_file", "apply_patch") and (body.startswith("편집 적용") or re.match(r"\S+ 저장\(\d+자\)", body)):
+        return f"[pruned] {name} {args.get('path', '')}: applied — {first[:120]}"
+    return body[:PRUNE_FAIL_KEEP] + f"\n…[pruned {len(body) - PRUNE_FAIL_KEEP} more chars to save context]"
+
+
+def prune_turn(msgs: list[dict], start: int, keep_rounds: int = 2) -> list[dict]:
+    """이번 턴(start 뒤)의 도구 결과 중 마지막 keep_rounds 묶음 전 것의 긴 출력을 한 줄로 바꾼다(LLM 호출 없음).
+    도구 호출 인자·<data> 감싸기·호출과 결과의 짝은 그대로 둔다."""
+    rounds = [i for i in range(max(start + 1, 0), len(msgs))
+              if msgs[i].get("role") == "assistant" and msgs[i].get("tool_calls")]
+    if len(rounds) <= keep_rounds:
+        return list(msgs)
+    stop = rounds[-keep_rounds] if keep_rounds > 0 else len(msgs)
+    out = list(msgs)
+    calls: dict[str, dict] = {}
+    for i in range(rounds[0], stop):
+        m = msgs[i]
+        if m.get("role") == "assistant":
+            calls.update({tc["id"]: tc for tc in m.get("tool_calls") or []})
+            continue
+        c = m.get("content")
+        if m.get("role") != "tool" or not isinstance(c, str) or len(c) <= PRUNE_OVER:
+            continue
+        tc = calls.get(m.get("tool_call_id"))
+        if tc is None:
+            continue
+        try:
+            args = json.loads(tc["function"].get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        args = args if isinstance(args, dict) else {}
+        w = _DATA_WRAP.match(c)
+        body = w.group(2) if w else c
+        if len(body) <= PRUNE_OVER or body.startswith("[pruned]"):
+            continue
+        short = _prune_one(tc["function"]["name"], args, body)
+        if len(short) >= len(body):
+            continue
+        out[i] = {**m, "content": (w.group(1) + short + w.group(3)) if w else short}
+    return out
+
+
 def user_requests(msgs: list[dict], limit: int = 5, each: int = 300, total: int = 1200) -> list[str]:
     """실제 사용자 요청(하네스 알림·요약 제외)을 최신부터."""
     out, used = [], 0
@@ -118,7 +189,7 @@ def summarize(msgs: list[dict], ledger=None, focus: str = "") -> str:
     prompt = SUMMARY_PROMPT + (f"\n\n특히 이것을 자세히 남겨라(사용자 지시): {focus}" if focus else "")
     try:
         r = llm.chat(msgs + [{"role": "user", "content": prompt}], max_tokens=700, temperature=0.1,
-                     ledger=ledger, tag="compact")
+                     ledger=ledger, tag="compact", think=False)
         body = (r["content"] or "").strip() or "(요약 없음)"
     except RuntimeError as exc:   # 요약 실패: Hermes 04 §2 처럼 가운데를 '요약 없음'으로 버린다
         body = f"(요약 실패: {llm.scrub(str(exc))[:120]})"
@@ -156,26 +227,50 @@ def test_summary(out: str, code: int) -> str:
     return "통과" if code == 0 else f"실패(exit {code})"
 
 
+def _test_id(raw: str) -> str:
+    """Windows 의 `tests\\test_a.py::t` 도 `tests/test_a.py::t` 로(파일 부분만 — 매개변수 id 는 그대로)."""
+    path, sep, rest = raw.partition("::")
+    return path.replace("\\", "/") + sep + rest
+
+
 def failing_tests(out: str, code: int) -> list[str]:
-    ids = sorted({m.group(2) for m in re.finditer(r"^(FAILED|ERROR)\s+(\S+)", out or "", re.M)})
+    ids = sorted({_test_id(m.group(2)) for m in re.finditer(r"^(FAILED|ERROR)\s+(\S+)", out or "", re.M)})
     if not ids and code not in (0, 5):
         ids = [f"<exit {code}>"]
     return ids
 
 
-def baseline_failures(ws: Path, sha: str, test_cmd: str) -> list[str]:
-    """턴 시작 스냅샷(그림자 git)을 임시 폴더에 풀어 같은 테스트를 돌려, 원래부터 실패하던 테스트를 센다."""
-    from .store import Shadow
+def is_pytest(cmd: str) -> bool:
+    toks = _norm_test_cmd(cmd)
+    return bool(toks) and toks[0] == "pytest" and not re.search(r"[;&|]", cmd or "")
+
+
+def baseline_failures(ws: Path, sha: str, test_cmd: str, sandbox: str = "") -> tuple[list[str], bool]:
+    """턴 시작 스냅샷(그림자 git)을 작업 폴더의 .cap/base-* 에 풀어 같은 테스트를 돌려, 원래부터 실패하던 테스트를 센다.
+    (작업 폴더 안이라야 Windows AppContainer 격리가 그 폴더에서 돌 수 있다.)
+    반환: (실패 목록, 완전한가). 수집 오류(그 파일의 테스트는 돌지 못함)·시간 초과·스냅샷 없음이면 완전하지 않다 —
+    그때 목록에 없는 테스트가 전에 통과했다고 말할 수 없다."""
+    from .store import CAP_DIR, Shadow
     from .tools import run_shell
-    data = Shadow(ws).archive(sha)
+    data = Shadow(ws).archive(sha) if sha else None
     if not data:
-        return []
-    tmp = Path(tempfile.mkdtemp(prefix="cap-base-"))
+        return [], False
+    cmd = test_cmd
+    if is_pytest(cmd) and "--continue-on-collection-errors" not in cmd:
+        cmd += " --continue-on-collection-errors"     # 한 파일의 import 오류로 나머지 테스트까지 멈추지 않게
+    root = ws / CAP_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="base-", dir=root))
     try:
         with tarfile.open(fileobj=io.BytesIO(data)) as tf:
             tf.extractall(tmp)
-        code, out = run_shell(test_cmd, tmp)
-        return failing_tests(out, code) if code != 0 else []
+        code, out = run_shell(cmd, tmp, sandbox=sandbox, pyws=ws)     # 원래 작업 폴더의 파이썬(.venv)으로
+        if code == 0:
+            return [], True
+        ids = failing_tests(out, code)
+        broken = (code == 124 or "Interrupted:" in out or "ERROR collecting" in out
+                  or any(t.startswith("<exit") or "::" not in t for t in ids))
+        return ids, not broken
     finally:
         _rmtree(tmp)
 

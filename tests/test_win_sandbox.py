@@ -93,3 +93,21 @@ def test_grant_every_file_also_grants_existing_files(monkeypatch):
     calls.clear()
     A.grant(r"C:\ws", "S-1-15-2-1", "M")
     assert len(calls) == 1 and "/T" not in calls[0]
+
+
+def test_project_venv_gets_its_base_python_and_file_grants(tmp_path, monkeypatch):
+    """프로젝트 .venv: 기본 파이썬 설치(작업 폴더 밖)에 읽기·실행, venv 파일마다 권한(uv 하드 링크), 패키지가 바뀔 때만 다시."""
+    from cap import appcontainer_exec as A
+    base = tmp_path / "py311"
+    base.mkdir()
+    ws = tmp_path / "proj"
+    (ws / ".venv" / "Lib" / "site-packages").mkdir(parents=True)
+    (ws / ".venv" / "pyvenv.cfg").write_text(f"home = {base}\nversion = 3.11\n", encoding="utf-8")
+    grants = []
+    monkeypatch.setattr(A, "grant", lambda path, sid, rights, every_file=False: grants.append((path, rights, every_file)) or (True, ""))
+    st = {"sid": "S-1-15-2-1", "rx": []}
+    monkeypatch.setattr(S, "_appc_save", lambda s: None)
+    note = S._appc_project_venv(ws, st)
+    assert (str(base), "RX", True) in grants and (str(ws / ".venv"), "M", True) in grants and str(base) in note
+    grants.clear()
+    assert S._appc_project_venv(ws, st) == "" and grants == []          # 바뀐 것 없음 → 다시 안 함
