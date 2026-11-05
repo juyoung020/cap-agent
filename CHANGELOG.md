@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Changed
+- The PyPI publish job runs only when the repository variable `PYPI_PUBLISH` is `true`; before PyPI is set up, a tag only builds and checks the package.
+
 ## [0.10.1] - 2026-11-06
 
 ### Fixed
