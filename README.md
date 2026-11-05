@@ -102,7 +102,7 @@ graph TD;
 
 ## Status
 
-- Measured on Windows 11 with `qwen3.5-9b` (16k context): small bug-fix tasks pass; the earlier multi-file result (2 of 7) was measured on a task whose own test was wrong and is being re-measured. Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
+- Measured on Windows 11 with `qwen3.5-9b` (16k context): small bug-fix tasks pass; a multi-file feature task passes 2 of 2 (an earlier low score came from a bug in the task itself). Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
 - Other providers were tested against a fake OpenAI-compatible server, not with real keys.
 - 469 tests: `python -m pytest -q tests` (no API calls).
 
