@@ -31,6 +31,7 @@ Type a task: "fix the failing test in calc.py", "add a --verbose flag". CAP plan
 - **Modes** (Shift+Tab): `chat` (read only) · `ask` (approve each edit and command, default) · `plan` (plan first, then approve) · `auto` (only risky actions ask) · `bypass`.
 - **Approvals** appear in place of the input box: *Yes* · *Yes, don't ask again this session* · *Yes, don't ask again in this project* · *No, and tell CAP what to do instead*.
 - **Commands**: `/review` `/commit` `/undo` `/rewind` `/continue` `/resume` `/fork` `/compact` `/plan` `/goal` `/task` `/skills` `/mcp` `/plugins` `/permissions` `/sandbox` `/provider` `/config` `/doctor` … (`/help`).
+- **Long-running jobs**: `cap go "task" --detach --until 08:00` splits a spec into stages and works through them while you are away. Each stage gets a fresh context, writes and locks its tests first, retries with a different approach, re-checks earlier stages and commits on a work branch. Anything that needs you goes to a question box (`cap inbox`, optional phone notifications) while other stages keep running; the final report re-runs every check. `cap go status` shows one status line.
 - **Scripts and CI**: `cap exec "task"`, `--json` (one result line), `--events` (JSONL progress, like `codex exec --json`), `--schema file.json`, `--max-turns N`, `-o last.txt`, `cap exec resume last "follow-up"`.
 - **From another agent**: `cap mcp-server` exposes a `run_task` MCP tool. The repository is also a Claude Code / Codex plugin.
 
@@ -108,7 +109,7 @@ graph TD;
 - Also run on a copy of a real research repository (267 files, 53 tests); the problems found there were fixed.
 - Tests run on Windows and Linux (Python 3.11, 3.12) in GitHub Actions.
 - Other providers were tested against a fake OpenAI-compatible server, not with real keys.
-- 517 tests: `python -m pytest -q tests` (no API calls).
+- 531 tests: `python -m pytest -q tests` (no API calls).
 
 ## License
 

@@ -22,7 +22,7 @@ from .evalcheck import collect_test_files
 from .policy import normalize_mode
 from .store import Ledger, Shadow, cap_dir, find_ws, now_id
 
-SUBCOMMANDS = {"init", "spec", "graph", "run", "resume", "status", "view", "rollback"}
+SUBCOMMANDS = {"init", "spec", "graph", "run", "resume", "status", "view", "rollback", "go", "inbox"}
 TOP_HELP = """사용법
   cap                         대화형 코딩 에이전트(현재 폴더). 할 일을 쓰면 바로 읽고·고치고·실행·테스트
   cap "할 일"  /  cap exec "할 일"   대화창 없이 한 번 실행하고 끝
@@ -72,6 +72,136 @@ def _need_ws() -> Path:
     if not cap_dir(ws).is_dir():
         raise SystemExit("`.cap/` 가 없다. 작업 폴더에서 먼저 `cap init`.")
     return ws
+
+
+# ---------------------------------------------------------------- go (긴 작업)
+
+def _until_hours(s: str) -> float:
+    """'08:00' → 지금부터 그 시각까지 시간(지났으면 내일)."""
+    import datetime as dt
+    h, m = (int(x) for x in s.split(":", 1))
+    now = dt.datetime.now()
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if t <= now:
+        t += dt.timedelta(days=1)
+    return (t - now).total_seconds() / 3600
+
+
+def cmd_go(a) -> int:
+    from . import longrun as LR
+    from .chat import ensure_cap
+    ws = find_ws()
+    ensure_cap(ws)
+    if a.task == "status" or (a.task is None and not a.resume):
+        ids = LR.runs(ws)
+        if not ids:
+            _out('긴 작업이 없다. 시작: cap go "할 일"')
+            return 0
+        for rid in ids[-5:]:
+            _out(LR.board_line(ws, rid))
+        rp = LR.run_dir(ws, ids[-1]) / "progress.md"
+        if rp.is_file():
+            _out("\n" + rp.read_text(encoding="utf-8"))
+        return 0
+    if a.resume:
+        rid = a.resume if a.resume != "last" else LR.latest(ws)
+        if not rid or not LR.load_run(ws, rid):
+            raise SystemExit("이어 갈 긴 작업이 없다.")
+        if a.detach:
+            _out(f"백그라운드에서 이어 감 (pid {LR.detach(ws, rid)}). 상태: cap go status")
+            return 0
+        LR.drive(ws, rid, printer=_out)
+        return 0
+    auto = "y" if a.yes else None
+    ledger = Ledger(ws, "go-" + now_id())
+    _out("① 스펙 초안을 쓰는 중…")
+    sp, questions = specmod.draft(a.task, ws, ledger=ledger)
+    for q in questions:
+        _out(f"\n질문 [{q['id']}] {q['question']}")
+        for i, o in enumerate(q["options"], 1):
+            _out(f"  {i}) {o}")
+        ans = _ask("  번호 또는 직접 입력 (Enter = 1) > ", "1" if a.yes else None).strip()
+        choice = q["options"][int(ans) - 1] if ans.isdigit() and 1 <= int(ans) <= len(q["options"]) else (ans or q["options"][0])
+        specmod.apply_answer(sp, q["id"], choice, q.get("kind", "text"))
+    for n in LR.split_requirements(sp) + LR.assign_test_files(sp, ws):
+        _out("  " + n)
+    preset = a.preset
+    if not preset:
+        _out("\n② 자리 비운 동안 묻지 않고 해도 되는 것:")
+        for i, k in enumerate(("safe", "normal", "bold"), 1):
+            _out(f"  {i}) {LR.PRESET_TEXT[k]}" + ("  ← 기본" if k == "normal" else ""))
+        ans = _ask("  번호 (Enter = 2) > ", "2" if a.yes else None).strip()
+        preset = {"1": "safe", "3": "bold"}.get(ans, "normal")
+    hours = _until_hours(a.until) if a.until else (a.hours or LR.DEFAULT_HOURS)
+    while True:
+        specmod.save(ws, sp, a.task)
+        spec_text = specmod.spec_path(ws).read_text(encoding="utf-8")
+        _out("\n③ 단계를 나누는 중…")
+        stages = LR.plan_stages(sp, ws, ledger=ledger)
+        checkable = sum(1 for r in sp.requirements if r.check)
+        _out(f"\n━━ {sp.title}")
+        _out(f"요구사항 {len(sp.requirements)}개 (자동 확인 {checkable}개) · 단계 {len(stages)}개 · "
+             f"{LR.PRESET_TEXT[preset].split(':')[0]} · 최대 {hours:.1f}시간 · 예상 약 {LR.estimate_minutes(stages)}분")
+        for s in stages:
+            _out(f"  {s['id']}. {s['title']}  ({', '.join(s['requirements'])})"
+                 + (f"  ← {', '.join(s['after'])} 뒤" if s["after"] else ""))
+        _out(f"자세한 스펙: {specmod.spec_path(ws)}")
+        if not stages:
+            _out("자동으로 확인할 수 있는 요구사항이 없어 돌릴 단계가 없다. [e] 로 스펙에 ⟨check: 명령⟩ 을 넣어 주세요.")
+        if a.dry:
+            _out("(--dry: 여기까지만)")
+            return 0
+        if not stages and a.yes:
+            return 1
+        ans = _ask("\n[Enter] 시작 / [e] 스펙 고치기 / [n] 그만 > ", "" if a.yes else None).strip().lower()
+        if ans in ("e", "edit"):
+            editor = os.environ.get("EDITOR") or ("notepad" if os.name == "nt" else "vi")
+            subprocess.call([editor, str(specmod.spec_path(ws))])
+            sp = specmod.parse(specmod.spec_path(ws).read_text(encoding="utf-8"))
+            sp.raw = a.task
+            continue
+        if ans in ("n", "no", "q") or not stages:
+            _out("그만둠. 스펙은 저장돼 있다.")
+            return 0
+        break
+    specmod.lock(ws)
+    rid = LR.create(ws, sp, spec_text, stages, preset=preset, hours=hours, use_worktree=not a.here)
+    cfg = LR.load_run(ws, rid)
+    if cfg.get("branch"):
+        _out(f"작업 브랜치 {cfg['branch']} (폴더 {cfg['worktree']}) 에서 돈다 — 원래 폴더는 계속 써도 된다.")
+    if a.detach:
+        _out(f"백그라운드 시작 (실행 {rid}, pid {LR.detach(ws, rid)}).")
+        _out("상태: cap go status · 질문: cap inbox · 보고서: .cap/long/" + rid + "/report.md")
+        return 0
+    LR.drive(ws, rid, printer=_out)
+    return 0
+
+
+def cmd_inbox(a) -> int:
+    from . import longrun as LR
+    ws = find_ws()
+    rid = a.run or LR.latest(ws)
+    if not rid:
+        _out("긴 작업이 없다.")
+        return 0
+    if a.qid:
+        q = LR.answer(ws, rid, a.qid, " ".join(a.text) if a.text else "")
+        if not q:
+            _out(f"열린 질문 {a.qid} 가 없다.")
+            return 1
+        state = LR.load_run(ws, rid).get("state")
+        _out(f"{a.qid} ← '{q['answer']}'. " + ("실행 중이라 다음 단계를 고를 때 반영된다." if state in ("running", "started", "restarting")
+                                             else f"이어서 돌리려면: cap go --resume {rid} [--detach]"))
+        return 0
+    qs = LR.open_questions(ws, rid)
+    _out(LR.board_line(ws, rid))
+    if not qs:
+        _out("답을 기다리는 질문이 없다.")
+    for q in qs:
+        _out(f"\n{q['id']} [{q['stage']}] {q['question']}")
+        _out("   " + " / ".join(f"{i}) {o}" for i, o in enumerate(q["options"], 1)) + f"   (기본: {q['default']})")
+        _out(f"   답하기: cap inbox {q['id']} <번호 또는 글>")
+    return 0
 
 
 # ---------------------------------------------------------------- init
@@ -477,7 +607,6 @@ def main(argv: list[str] | None = None) -> int:
         elif a0 == "--plain":
             plain, i = True, i + 1
         elif a0 == "--provider" and i + 1 < len(args):       # Codex: -c model_provider=… / --oss
-            from . import llm
             try:
                 _out(llm.use_provider(args[i + 1]))
             except ValueError as exc:
@@ -485,7 +614,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             i += 2
         elif a0 == "--model" and i + 1 < len(args):
-            from . import llm
             llm.MODEL, i = args[i + 1], i + 2
         elif a0 == "--profile" and i + 1 < len(args):
             from .compat import apply_profile
@@ -668,6 +796,23 @@ def main(argv: list[str] | None = None) -> int:
         g.add_argument("--no", action="store_true", help="승인 질문에 자동 n")
         g.add_argument("--pause", action="store_true", help="승인·질문에서 멈추고 종료(나중에 cap resume)")
         p.set_defaults(fn=fn)
+    p = sub.add_parser("go", help="긴 작업: 할 일 → 스펙·단계 → 자리 비운 동안 끝까지 (status·--resume)")
+    p.add_argument("task", nargs="?", help='할 일 문장, 또는 "status"')
+    p.add_argument("--preset", choices=["safe", "normal", "bold"], help="묻지 않고 해도 되는 범위")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--hours", type=float, help="최대 실행 시간(기본 8)")
+    g.add_argument("--until", help="이 시각까지 (예: 08:00)")
+    p.add_argument("--detach", action="store_true", help="백그라운드로 (창을 닫아도 계속)")
+    p.add_argument("--resume", nargs="?", const="last", help="멈춘·끝난 실행을 답 반영해 이어서")
+    p.add_argument("--here", action="store_true", help="git worktree 를 만들지 않고 이 폴더에서")
+    p.add_argument("--dry", action="store_true", help="스펙·단계까지만 보여 주기")
+    p.add_argument("--yes", action="store_true", help="질문은 기본값으로")
+    p.set_defaults(fn=cmd_go)
+    p = sub.add_parser("inbox", help="긴 작업의 질문함: 목록 / cap inbox q1 <답>")
+    p.add_argument("qid", nargs="?")
+    p.add_argument("text", nargs="*")
+    p.add_argument("--run")
+    p.set_defaults(fn=cmd_inbox)
     p = sub.add_parser("status", help="스펙·계획·실행 상태")
     p.set_defaults(fn=cmd_status)
     p = sub.add_parser("view", help="정적 HTML 뷰어(Mermaid) 생성")

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-08
+
+### Added
+- Long-running jobs, `cap go "task"`: spec draft → autonomy preset (safe, normal, bold) → stages → one summary screen to confirm → run. Each stage gets a fresh context (a short work packet), writes and locks its tests before implementing, changes approach on each retry (as is → failure cause + smallest fix → one file at a time), re-checks earlier stages and rolls back if it broke them, and commits. At the end every check is run again for the report.
+- `--detach` (a supervisor restarts a dead run from its checkpoint; sleep is blocked while running), `--until` / `--hours` deadline, a git worktree work branch, and a one-line status board in `cap go status`.
+- Question box `cap inbox`: an action that needs approval is declined and turned into a question, and a stage that failed three times waits while other stages keep running. Unanswered questions take their default after 30 minutes. Phone notifications (ntfy) with answer buttons.
+- A requirement whose check names several test files is split per file, and functional requirements in a project without tests get one test file each.
+
+### Fixed
+- Sub-commands such as `cap spec` and `cap graph` failed at exit with a name error for `llm`.
+
 ## [0.11.0] - 2026-11-06
 
 ### Added
@@ -67,7 +78,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - LangGraph coding loop with permission table, approvals, checkpoints (`/continue`), test gate, sub-agents.
 - Claude Code / Codex compatibility: skills, commands, sub-agents, hooks, MCP (tools, resources, prompts), plugins.
 
-[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/juyoung020/cap-agent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/juyoung020/cap-agent/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/juyoung020/cap-agent/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/juyoung020/cap-agent/compare/v0.10.0...v0.10.1
