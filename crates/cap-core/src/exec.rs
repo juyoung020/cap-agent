@@ -50,6 +50,9 @@ fn command(cmd: &str) -> Command {
         // `chcp 65001` makes console programs print UTF-8.
         let mut c = Command::new("cmd");
         c.raw_arg(format!("/S /C \"chcp 65001>nul & {cmd}\""));
+        // A console of its own that nobody sees: `chcp` and whatever else the command does to its console
+        // leave the terminal of the person alone.
+        c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         c
     }
     #[cfg(not(windows))]
@@ -63,57 +66,64 @@ fn command(cmd: &str) -> Command {
 }
 
 /// The processes of a running command; dropping it while they run stops them all.
-struct Tree(Option<u32>);
+struct Tree {
+    /// The process group the command was started in.
+    #[cfg(not(windows))]
+    group: Option<u32>,
+    /// `cmd` starts the real program as a child; the job holds them all.
+    #[cfg(windows)]
+    job: Option<crate::sandbox::windows::Job>,
+}
 
 impl Tree {
-    fn stop(pid: u32) {
-        #[cfg(unix)]
-        // SAFETY: a signal to the process group this module created for the command.
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    fn of(child: &tokio::process::Child) -> Tree {
+        #[cfg(not(windows))]
+        {
+            Tree { group: child.id() }
         }
         #[cfg(windows)]
         {
-            // `cmd` starts the real program as a child; `taskkill /T` ends the whole tree.
-            let _ = std::process::Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+            let job = crate::sandbox::windows::Job::new().ok();
+            if let (Some(job), Some(process)) = (&job, child.raw_handle()) {
+                // SAFETY: the handle belongs to the child, which is alive in this scope.
+                unsafe { job.adopt(process) };
+            }
+            Tree { job }
         }
-        #[cfg(not(any(unix, windows)))]
-        let _ = pid;
     }
 
+    /// End every process of the command now.
+    fn stop(&mut self) {
+        #[cfg(not(windows))]
+        if let Some(group) = self.group.take() {
+            // SAFETY: a signal to the process group this module created for the command.
+            unsafe {
+                libc::kill(-(group as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            job.kill();
+        }
+    }
+
+    /// The command ended by itself: what it left running stays.
     fn ended(&mut self) {
-        self.0 = None;
+        #[cfg(not(windows))]
+        {
+            self.group = None;
+        }
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            job.release();
+        }
     }
 }
 
 impl Drop for Tree {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            Tree::stop(pid);
-        }
+        self.stop();
     }
-}
-
-async fn kill_tree(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-        }
-        #[cfg(not(windows))]
-        Tree::stop(pid);
-    }
-    let _ = child.kill().await;
 }
 
 /// Turn what a command printed into the text the model reads.
@@ -173,7 +183,7 @@ pub async fn shell_in(sandbox: &Sandbox, cmd: &str, cwd: &Path, timeout: Duratio
         Ok(child) => child,
         Err(e) => return Output::not_started(format!("could not start the command: {e}")),
     };
-    let mut tree = Tree(child.id());
+    let mut tree = Tree::of(&child);
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let read_out = tokio::spawn(async move {
@@ -191,7 +201,8 @@ pub async fn shell_in(sandbox: &Sandbox, cmd: &str, cwd: &Path, timeout: Duratio
         Ok(Ok(status)) => (status.code(), false),
         Ok(Err(_)) => (None, false),
         Err(_) => {
-            kill_tree(&mut child).await;
+            tree.stop();
+            let _ = child.kill().await;
             (None, true)
         }
     };
@@ -278,8 +289,12 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_command_takes_its_processes_with_it() {
         let dir = crate::testing::TempDir::new("drop");
-        // The marker appears only if the command lives past its wait.
-        let cmd = if cfg!(windows) { "ping -n 4 127.0.0.1 >nul & echo late> late.txt" } else { "sleep 2; echo late > late.txt" };
+        // The marker is written by a shell that the command's own shell started; it appears only if that one lives on.
+        let cmd = if cfg!(windows) {
+            "cmd /c \"ping -n 4 127.0.0.1 >nul & echo late> late.txt\""
+        } else {
+            "sh -c 'sleep 2; echo late > late.txt'"
+        };
         let run = shell(cmd, dir.path(), Duration::from_secs(30));
         assert!(tokio::time::timeout(Duration::from_millis(400), run).await.is_err());
         tokio::time::sleep(Duration::from_millis(4500)).await;

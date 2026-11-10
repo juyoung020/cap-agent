@@ -4,9 +4,9 @@ A coding agent for small local models, written in Rust.
 
 **The model proposes; the code decides.** The model suggests the next step. Whether a file may be changed, whether a command may run, and whether the work is finished are decided by the harness. A run ends as *done* only when the project's tests pass.
 
-![cap exec fixes a one-line bug: it reads the file, runs the tests, replaces one line, and the tests pass](docs/demo.gif)
+![The cap window: the model finds a one-line bug, the failing test and the change are shown, the tests pass, and a command waits for a yes](docs/demo.gif)
 
-<sub>One real run on Linux with `qwen3.5-9b` on the KAU server, commands isolated by Landlock. Pauses longer than 3 s are cut to 3 s; the run took 22.6 s.</sub>
+<sub>One continuous recording of the window on Windows with `qwen3.5-9b` on the KAU server, at its real speed (65 s).</sub>
 
 Status: **alpha** (`0.15.0-alpha.1`). The conversation (`cap`), the one-shot command (`cap exec`), isolation of commands by the operating system, skills, MCP servers and the settings file work and are covered by tests. How much each part helps a real model is not measured yet. The plan is in [docs/PLAN.md](docs/PLAN.md); the principles are in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) (both in Korean).
 
@@ -30,20 +30,32 @@ The result is one executable: `target/release/cap` (`cap.exe` on Windows).
 cap -C path/to/project
 ```
 
-`cap` alone starts a conversation in the project folder. Type a task or a question; the model's text is shown while it arrives, and each turn ends with the verdict, the changed files, the steps, the time and the context in use.
+`cap` alone opens a window in the terminal for a conversation in the project folder. Type a task or a question. The model's text is shown while it arrives; a test run, a changed file and a command each get a short entry with their result; a turn ends with the verdict, the calls, the time and the changed files. The row at the bottom shows the mode, the share of the context in use, the calls and the time.
+
+| Key | Meaning |
+|---|---|
+| Enter | Send (Alt+Enter or Ctrl+J starts a new line) |
+| Tab | Complete a command |
+| Shift+Tab | Change the mode |
+| Ctrl+O | Open or fold the details of the entries |
+| PgUp, PgDn, the wheel | Scroll |
+| Esc | Stop the turn that is running |
+| Ctrl+C twice | End |
+
+A message typed while a turn runs waits in a queue and is sent when the turn ends. When a command needs a yes, a question takes the place of the input box: yes, yes for the rest of the session, or no.
 
 | Command | Meaning |
 |---|---|
-| `/help` | The list of commands |
+| `/help` | The commands and the keys |
 | `/status` | The model, the context in use, the mode, the tool set, the tests and the isolation |
 | `/mode NAME` | `read`, `edit` or `auto` |
 | `/model NAME` | Talk to another model of the same server |
 | `/clear` | Start over with an empty conversation |
 | `/skills` | The skills the agent can use here |
 | `/mcp` | The outside tool servers and their tools |
-| `/quit` | End (so does the end of the input) |
+| `/quit` | End (so does `/exit`) |
 
-A line that ends with `\` continues in the next line. Ctrl-C stops the turn that is running.
+With `CAP_PLAIN=1`, or when the input or the output is a file or a pipe, the conversation is a line prompt: a line that ends with `\` continues in the next line, Ctrl-C stops the turn that is running, and the end of the input ends the conversation. `NO_COLOR` keeps the window to bold and faint text.
 
 ### One task
 
@@ -111,7 +123,7 @@ Without `--test`, CAP finds the test command from the project files: `cargo test
 | `ANSWERED` (a question, nothing changed) | `answered` | 0 |
 | `DONE, NOT VERIFIED` (files changed, the project has no tests) | `unverified` | 3 |
 | `NOT DONE` | `tests_fail`, `step_limit`, `stuck`, `model_failed`, `context_full` | 1 |
-| `STOPPED` (Ctrl-C) | `interrupted` | 130 |
+| `STOPPED` (Ctrl-C, or Esc in the window) | `interrupted` | 130 |
 | a setup or usage error | | 2 |
 
 When the model says it is finished, CAP runs the tests. If they fail, the failure output goes back to the model and the work continues. After four rejected "done" claims, or the same failure three times, the run ends as `tests_fail`.
@@ -221,8 +233,9 @@ cap exec "fix the failing test" --base-url http://localhost:8000/v1 --model my-m
 
 ## What is tested
 
-- 153 tests on Windows and 152 on Linux (`cargo test --workspace`): the tools, line edits, the permission table, the test verdicts, context fitting, the code map, the board, skills, the MCP protocol, the settings file, the loop and whole conversations against a scripted model, the HTTP client against a local mock server, and the isolation against real commands (Landlock on Linux, AppContainer on Windows).
-- Single trial runs with `qwen3.5-9b` on the KAU server: the one-line bug fix above on Windows with isolation off (4 model calls; 17.9 s and 25.1 s in two runs), the same fix on Linux with Landlock isolation (4 model calls, 22.6 s; the recording at the top), and a piped conversation with one question and the slash commands.
+- 192 tests on Windows and 191 on Linux (`cargo test --workspace`): the window drawn into a text grid, the tools, line edits, the permission table, the test verdicts, context fitting, the code map, the board, skills, the MCP protocol, the settings file, the loop and whole conversations against a scripted model, the HTTP client against a local mock server, and the isolation against real commands (Landlock on Linux, AppContainer on Windows).
+- Single trial runs with `qwen3.5-9b` on the KAU server: the one-line bug fix above on Windows with isolation off (4 model calls; 17.9 s and 25.1 s in two runs), the same fix on Linux with Landlock isolation (4 model calls, 22.6 s), a piped conversation with one question and the slash commands, and the session in the window on Windows that the recording at the top shows (the fix in 3 model calls and 16 s, then a command that asks first, 2 calls and 14 s).
+- The window was tried by hand in Windows Terminal: typing, Korean text, scrolling, the modes, completion, the approval card, Esc and Ctrl+C.
 - The other provider entries are checked against the mock server only. MCP is checked with the protocol tests; no outside MCP server has been run with it.
 - The effect of each feature on a real model has not been measured. A comparison with other agents on the same model and tasks is phase 6 of the plan and has not been run.
 

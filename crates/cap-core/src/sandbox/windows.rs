@@ -131,6 +131,24 @@ impl Job {
         // SAFETY: the job handle is open.
         unsafe { TerminateJobObject(self.0.0, 1) };
     }
+
+    /// Put a running process in the job; what it starts from now on is in the job too.
+    ///
+    /// # Safety
+    /// `process` is an open process handle.
+    pub unsafe fn adopt(&self, process: HANDLE) {
+        // SAFETY: both handles are open; a process that has already ended is refused, which is harmless.
+        unsafe { AssignProcessToJobObject(self.0.0, process) };
+    }
+
+    /// Close the job and leave its processes running.
+    pub fn release(self) {
+        // SAFETY: an all-zero limit structure is valid and takes the kill-on-close limit away.
+        unsafe {
+            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            SetInformationJobObject(self.0.0, JobObjectExtendedLimitInformation, (&raw const info).cast(), size_of_val(&info) as u32);
+        }
+    }
 }
 
 /// What a finished command left: exit code, raw output, and whether the time ran out.

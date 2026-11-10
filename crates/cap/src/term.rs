@@ -44,7 +44,7 @@ impl Out {
 
 /// Ask the Windows console to read colour codes. Other systems read them as they are.
 #[cfg(windows)]
-fn colour_codes_work(out: Out) -> bool {
+pub(crate) fn colour_codes_work(out: Out) -> bool {
     use windows_sys::Win32::System::Console::{
         ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
     };
@@ -62,7 +62,7 @@ fn colour_codes_work(out: Out) -> bool {
 }
 
 #[cfg(not(windows))]
-fn colour_codes_work(_: Out) -> bool {
+pub(crate) fn colour_codes_work(_: Out) -> bool {
     true
 }
 
@@ -168,7 +168,7 @@ impl Screen {
         let p = self.paint;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         match event {
-            Event::Step(_) => String::new(),
+            Event::Step(_) | Event::Context(_) => String::new(),
             Event::Delta(piece) => {
                 if !self.live || piece.is_empty() {
                     return String::new();

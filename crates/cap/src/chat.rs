@@ -7,16 +7,19 @@ use cap_core::model::{Message, Model};
 use cap_core::perm::Mode;
 use std::io::IsTerminal;
 
-const HELP: &str = "\
+/// What each command does.
+pub(crate) const COMMANDS: &str = "\
 /help          this list
 /status        the model, the context in use, the mode, the tests and the isolation
-/mode NAME     read (look only), edit (change files, run tests) or auto (also run other commands unasked)
+/mode NAME     read (look only), edit (change files, run tests), auto (run commands unasked)
 /model NAME    talk to another model of the same server
 /clear         start over with an empty conversation
 /skills        the skills the agent can use here
 /mcp           the outside tool servers and their tools
-/quit          end (so does /exit, and the end of the input)
-A line that ends with \\ goes on in the next line. Ctrl-C stops the turn that is running.";
+/quit          end (so does /exit, and the end of the input)";
+
+/// What else the line prompt understands.
+const KEYS: &str = "A line that ends with \\ goes on in the next line. Ctrl-C stops the turn that is running.";
 
 /// A line that starts with a slash.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,7 +115,7 @@ pub fn outcome(report: &Report, shown: &str, paint: Paint) -> String {
     out
 }
 
-fn status_text(ready: &Ready, used: u32) -> String {
+pub(crate) fn status_text(ready: &Ready, used: u32) -> String {
     let s = &ready.settings;
     let tools: usize = ready.hub.tools().len();
     let servers = ready.hub.servers().count();
@@ -132,7 +135,7 @@ fn status_text(ready: &Ready, used: u32) -> String {
 }
 
 /// Why the conversation loop handed back.
-enum Next {
+pub(crate) enum Next {
     Quit,
     Mode(Mode),
     Model(String),
@@ -171,7 +174,7 @@ async fn converse<M: Model>(
             Some(Command::Model(Some(name))) => return (session.into_history(), Next::Model(name)),
             Some(command) => {
                 out.line(&match command {
-                    Command::Help => HELP.to_string(),
+                    Command::Help => format!("{COMMANDS}\n{KEYS}"),
                     Command::Mode(_) => {
                         format!("the mode is {}. /mode read, /mode edit or /mode auto changes it", ready.settings.mode.as_str())
                     }

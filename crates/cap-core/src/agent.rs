@@ -151,6 +151,8 @@ pub struct Report {
 
 pub enum Event<'a> {
     Step(u32),
+    /// The tokens the conversation takes, counted before each call to the model.
+    Context(u32),
     /// A piece of the model's text while it arrives.
     Delta(&'a str),
     /// The complete text the model wrote next to its tool calls.
@@ -833,6 +835,7 @@ impl<'a, M: Model> Session<'a, M> {
             let board = has_board.then(|| self.board());
             self.turn.steps += 1;
             self.emit(Event::Step(self.turn.steps));
+            self.emit(Event::Context(self.tokens()));
             let with_board: Option<Vec<Message>> = board.map(|board| {
                 let mut copy = self.msgs.clone();
                 match copy.last_mut() {

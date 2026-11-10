@@ -3,6 +3,7 @@
 mod chat;
 mod config;
 mod term;
+mod tui;
 
 use cap_core::agent::{Agent, Config, Quiet, Report, Sink, Status};
 use cap_core::cancel::Cancel;
@@ -17,7 +18,7 @@ use cap_core::workspace::Workspace;
 use clap::{Args, Parser, Subcommand};
 use config::{Env, Flags, Settings};
 use serde_json::json;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -25,7 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use term::{Ask, Out, Paint, Screen, first_line};
 
 const SETTINGS_HELP: &str = "A flag wins over an environment variable (CAP_PROVIDER, CAP_MODEL, CAP_BASE_URL, CAP_CONTEXT, \
-CAP_API_KEY), which wins over the settings file. `cap config` shows the file's place and the settings in force.";
+CAP_API_KEY), which wins over the settings file. `cap config` shows the file's place and the settings in force. \
+CAP_PLAIN=1 makes the conversation a line prompt in place of the window.";
 
 #[derive(Parser)]
 #[command(
@@ -427,10 +429,19 @@ async fn exec(args: ExecArgs, env: Env<'_>) -> Result<ExitCode, String> {
     Ok(ExitCode::from(exit_code(&report.status)))
 }
 
+/// Whether the conversation gets the window: a person at a terminal that can be drawn on, who did not ask for lines.
+fn wants_window(env: Env<'_>) -> bool {
+    env("CAP_PLAIN").is_none() && std::io::stdin().is_terminal() && Out::Stdout.is_terminal() && term::colour_codes_work(Out::Stdout)
+}
+
 async fn converse(common: &Common, env: Env<'_>) -> Result<ExitCode, String> {
     let ready = prepare(common, env).await?;
-    let interrupt = Interrupt::listen();
-    chat::run(ready, &interrupt).await;
+    if wants_window(env) {
+        tui::run(ready, env).await.map_err(|e| format!("the terminal did not open the window ({e}); CAP_PLAIN=1 talks line by line"))?;
+    } else {
+        let interrupt = Interrupt::listen();
+        chat::run(ready, &interrupt).await;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

@@ -18,6 +18,8 @@ serde_json.workspace = true
 tokio.workspace = true
 clap.workspace = true
 toml.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }

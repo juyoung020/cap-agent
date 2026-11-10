@@ -99,6 +99,7 @@ impl Sink for Recorder {
     fn event(&self, event: &Event<'_>) {
         let line = match event {
             Event::Step(n) => format!("step:{n}"),
+            Event::Context(_) => return,
             Event::Delta(text) => format!("delta:{text}"),
             Event::Text(text) => format!("text:{text}"),
             Event::Answer(text) => format!("answer:{text}"),
