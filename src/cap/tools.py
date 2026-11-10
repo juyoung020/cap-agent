@@ -150,8 +150,10 @@ def clip(text: str, limit: int = MAX_OUT) -> str:
 class EditResult:
     ok: bool
     message: str
-    stage: str = ""          # exact | rstrip | indent | unicode | spaces | already_applied
+    stage: str = ""          # exact | rstrip | indent | unicode | spaces | already_applied | noop
     new_text: str | None = None
+    note: str = ""           # 성공한 묶음 편집에서 건너뛴 항목 안내
+    applied: list = field(default_factory=list)   # 적용된 항목마다 (적용 전 글, old, new, 적용 후 글)
 
 
 def _find_line_block(lines: list[str], old_lines: list[str], norm) -> list[int]:
@@ -300,6 +302,77 @@ def strip_numbered_content(s: str) -> tuple[str, str]:
                "copied from read_file output. The file was not changed. Send the content without those prefixes.")
 
 
+ECHO_MIN_LINES = 8       # old 가 이 줄 수 이상이고
+ECHO_SHARE = 0.7         # 그 가운데 이 비율 이상을 new 에 그대로 다시 썼으면 알려 준다
+ECHO_SHORTER = 0.6       # 짧은 편집이 보낸 글자 수의 이 비율 이하일 때만(줄어드는 것이 뚜렷할 때)
+ECHO_SHOW_LINES = 6      # 예시로 보여 주는 짧은 old·new 의 최대 줄 수
+ECHO_NOTES = 3           # 한 요청에서 알려 주는 횟수
+REWRITE_MIN_LINES = 20   # write_file 로 덮어쓴 파일이 이 줄 수 이상이고
+REWRITE_SHARE = 0.8      # 그 가운데 이 비율 이상이 그대로면 알려 준다
+
+
+def trim_edit(before: str, old: str, new: str, after: str) -> tuple[int, int, int, str, str] | None:
+    """old·new 양끝의 같은 줄을 떼어 낸 짧은 편집. 원래 편집과 결과가 똑같을 때만 돌려준다.
+    반환: (old 줄 수, new 줄 수, 실제로 바뀐 줄 수, 짧은 old, 짧은 new). 줄일 것이 없으면 None."""
+    ol = old.replace("\r\n", "\n").strip("\n").split("\n")
+    nw = new.replace("\r\n", "\n").strip("\n").split("\n")
+    if len(ol) < ECHO_MIN_LINES:
+        return None
+    short = min(len(ol), len(nw))
+    p = 0
+    while p < short and ol[p] == nw[p]:
+        p += 1
+    s = 0
+    while s < short - p and ol[-1 - s] == nw[-1 - s]:
+        s += 1
+    changed = max(len(ol), len(nw)) - p - s
+    if changed <= 0 or (p + s) / len(ol) < ECHO_SHARE:
+        return None
+    for ctx in range(4):                     # 고유해질 때까지 앞뒤로 한 줄씩 넓힌다
+        a, tail = max(0, p - ctx), min(s, ctx)
+        so, sn = "\n".join(ol[a:len(ol) - s + tail]), "\n".join(nw[a:len(nw) - s + tail])
+        if not so.strip() or so == sn:
+            continue
+        if so.count("\n") >= ECHO_SHOW_LINES or len(so) + len(sn) > (len(old) + len(new)) * ECHO_SHORTER:
+            return None
+        r = apply_edit(before, so, sn)
+        if r.ok and r.new_text == after:
+            return len(ol), len(nw), changed, so, sn
+    return None
+
+
+def echo_note(applied: list) -> str:
+    """바꾼 줄보다 훨씬 많은 줄을 old·new 에 다시 써 보낸 편집이면, 같은 결과를 내는 짧은 편집을 보여 준다."""
+    best = None
+    for before, old, new, after in applied:
+        t = trim_edit(before, old, new, after)
+        if t and (best is None or t[0] - t[2] > best[0] - best[2]):
+            best = t
+    if not best:
+        return ""
+    n_old, n_new, changed, so, sn = best
+    block = lambda x: "```\n" + x + "\n```" if x else "(empty)"   # noqa: E731
+    return (f"\n[harness] This edit sent {n_old} lines of old and {n_new} lines of new to change {changed} "
+            f"line{'s' if changed != 1 else ''}. The rest was copied unchanged, and every copied line costs time. "
+            f"The same change with less writing:\nold:\n{block(so)}\nnew:\n{block(sn)}\n"
+            "From now on send only the lines that change, plus just enough around them to be unique.")
+
+
+def rewrite_note(path: str, before: str, content: str) -> str:
+    """이미 있는 긴 파일을 거의 그대로 write_file 로 다시 써 보냈으면 edit_file 이 빠르다고 알려 준다."""
+    import difflib
+    a, b = before.splitlines(), content.splitlines()
+    if len(a) < REWRITE_MIN_LINES:
+        return ""
+    same = sum(m.size for m in difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks())
+    changed = max(len(a), len(b)) - same
+    if changed <= 0 or same / max(len(a), len(b)) < REWRITE_SHARE:
+        return ""
+    return (f"\n[harness] This write_file sent all {len(b)} lines of {path} to change {changed}. The rest was copied "
+            "unchanged, and every copied line costs time. For a change this small use edit_file with only the lines "
+            "that change.")
+
+
 def closest_lines_hint(text: str, old: str, top: int = 3) -> str:
     """'혹시 이 부분인가요?' — old 의 첫 의미 있는 줄과 비슷한 줄 3개를 앞뒤 1줄과 함께(Hermes 07 §4-7)."""
     import difflib
@@ -365,28 +438,50 @@ def _restore_spacing(line: str, text: str) -> str:
 
 
 MAX_EDITS = 10
+NOOP_EDIT = ("old and new are identical, so this edit changes nothing and the file is as it was. If this part is "
+             "already the way you want it, go on to the next step. If a change is still needed here, send only the "
+             "lines that differ.")
 
 
 def apply_edit_args(text: str, args: dict) -> EditResult:
-    """edit_file 인자 → 결과. `edits`(여러 곳, 위에서부터 차례로 적용, 하나라도 실패하면 아무것도 안 바뀜) 또는 old/new."""
+    """edit_file 인자 → 결과. `edits`(여러 곳, 위에서부터 차례로 적용, 하나라도 실패하면 아무것도 안 바뀜) 또는 old/new.
+    묶음 안에서 old 와 new 가 같은 항목은 바꿀 것이 없으므로 건너뛰고 나머지를 적용한다."""
     edits = args.get("edits")
     if not edits:
-        return apply_edit(text, strip_line_numbers(args.get("old") or ""), strip_line_numbers(args.get("new") or ""))
+        old, new = strip_line_numbers(args.get("old") or ""), strip_line_numbers(args.get("new") or "")
+        r = apply_edit(text, old, new)
+        if r.ok and r.new_text is not None:
+            r.applied = [(text, old, new, r.new_text)]
+        return r
     if not isinstance(edits, list) or len(edits) > MAX_EDITS:
         return EditResult(False, f"edits must be a list of at most {MAX_EDITS} {{old, new}} items")
-    cur, stages, changed = text, [], False
+    cur, stages, same, applied = text, [], [], []
     for k, e in enumerate(edits, 1):
         if not isinstance(e, dict):
             return EditResult(False, f"edit #{k}: must be {{old, new}}")
-        r = apply_edit(cur, strip_line_numbers(e.get("old") or ""), strip_line_numbers(e.get("new") or ""))
+        old, new = strip_line_numbers(e.get("old") or ""), strip_line_numbers(e.get("new") or "")
+        if old and old == new:
+            same.append(k)
+            stages.append("same")
+            continue
+        r = apply_edit(cur, old, new)
         if not r.ok:
             return EditResult(False, f"edit #{k} of {len(edits)} failed (nothing was changed): {r.message}")
         stages.append(r.stage)
         if r.new_text is not None:
-            cur, changed = r.new_text, True
-    if not changed:
-        return EditResult(True, "이미 적용됨, 변경 없음", "already_applied")
-    return EditResult(True, "", f"{len(edits)} edits: " + ",".join(stages), cur)
+            applied.append((cur, old, new, r.new_text))
+            cur = r.new_text
+    if len(same) == len(edits):
+        return EditResult(False, f"All {len(edits)} edits have identical old and new, so nothing changes and the "
+                          "file is as it was. If the file is already the way you want it, go on to the next step. "
+                          "If a change is still needed, send only the lines that differ.", "noop")
+    note = ""
+    if same:
+        note = ("\nSkipped edit " + ", ".join(f"#{k}" for k in same) + f" of {len(edits)}: old and new were "
+                "identical there, so there was nothing to change. The other edits are in the file.")
+    if not applied:
+        return EditResult(True, "이미 적용됨, 변경 없음", "already_applied", note=note)
+    return EditResult(True, "", f"{len(edits)} edits: " + ",".join(stages), cur, note, applied)
 
 
 def apply_edit(text: str, old: str, new: str) -> EditResult:
@@ -394,7 +489,7 @@ def apply_edit(text: str, old: str, new: str) -> EditResult:
     if old == "":
         return EditResult(False, "old 가 비었다. 새 파일이면 write_file 을 써라.")
     if old == new:
-        return EditResult(False, "old 와 new 가 같다.")
+        return EditResult(False, NOOP_EDIT, "noop")
     new = "\n".join(_restore_spacing(ln, text) for ln in new.split("\n"))
     # 1단계: 정확
     cnt = text.count(old)
@@ -695,6 +790,7 @@ class ToolBox:
     todos: list[dict] = field(default_factory=list)
     file_hashes: dict[str, str] = field(default_factory=dict)   # CAP 이 마지막으로 읽거나 쓴 내용의 해시
     edit_fails: dict[str, int] = field(default_factory=dict)    # 파일별 연속 편집 실패 수
+    echo_notes: int = 0          # 이번 요청에서 '다시 쓴 줄' 안내를 붙인 횟수(ECHO_NOTES 까지)
     # 나눠 읽은 줄 범위 {path: {"hash", "ranges": [[a, b], ...]}} — 같은 내용에서 1~끝을 다 덮으면 통째로 읽은 셈
     read_ranges: dict[str, dict] = field(default_factory=dict)
     sandbox: str = ""            # 명령 격리 방식(sandbox.py). "" = 격리 없음
@@ -828,6 +924,8 @@ class ToolBox:
         res = apply_edit_args(raw, {"old": old, "new": new, "edits": edits})
         if edits:
             old = strip_line_numbers(next((e.get("old", "") for e in edits if isinstance(e, dict)), ""))
+        if not res.ok and res.stage == "noop":   # 바꿀 것이 없는 편집: 찾기 실패가 아니므로 힌트·실패 횟수 없음
+            return {"ok": False, "output": res.message, "changed": [], "stage": "noop"}
         if not res.ok:
             n = self.edit_fails.get(r, 0) + 1
             self.edit_fails[r] = n
@@ -841,7 +939,7 @@ class ToolBox:
             return {"ok": False, "output": msg, "changed": [], "stage": "fail"}
         self.edit_fails.pop(r, None)
         if res.new_text is None:
-            return {"ok": True, "output": res.message, "changed": [], "stage": res.stage}
+            return {"ok": True, "output": res.message + res.note, "changed": [], "stage": res.stage}
         bad = data_break(r, raw, res.new_text)
         if bad:                                 # 멀쩡하던 JSON·TOML·YAML 을 깨는 편집은 쓰기 전에 거부
             return {"ok": False, "output": f"Not applied: after this edit {r} would no longer parse ({bad}). "
@@ -859,8 +957,15 @@ class ToolBox:
         if not note:
             from .extras import lint_delta
             note = lint_delta(r, raw, res.new_text)
-        return {"ok": True, "output": f"편집 적용({res.stage})" + warn + diff + note, "changed": [r],
-                "stage": res.stage, "syntax_error": bool(note)}
+        return {"ok": True, "output": f"편집 적용({res.stage})" + warn + diff + res.note + note
+                + self._echo(echo_note(res.applied)), "changed": [r], "stage": res.stage, "syntax_error": bool(note)}
+
+    def _echo(self, note: str) -> str:
+        """'다시 쓴 줄' 안내는 한 요청에 ECHO_NOTES 번까지만 붙인다(같은 말이 쌓이면 소음)."""
+        if not note or self.echo_notes >= ECHO_NOTES or "no_echo" in os.getenv("CAP_ABLATION", ""):
+            return ""
+        self.echo_notes += 1
+        return note
 
     def check_edit(self, path: str, old: str, new: str, edits: list | None = None) -> str:
         """승인을 묻기 전에 해 보는 편집(적용하지 않음). 적용될 수 없으면 모델에게 돌려줄 문장."""
@@ -872,7 +977,7 @@ class ToolBox:
         if res.ok:
             bad = data_break(rel(self.ws, fp), raw, res.new_text) if res.new_text is not None else ""
             return f"after this edit {rel(self.ws, fp)} would no longer parse ({bad})." if bad else ""
-        if edits:
+        if edits or res.stage == "noop":
             return res.message
         return res.message + ("" if "일치한다" in res.message else closest_lines_hint(raw, strip_line_numbers(old)))
 
@@ -919,6 +1024,9 @@ class ToolBox:
         tag = " (removed the line-number prefixes copied from read_file)" if stripped != content else ""
         content = stripped
         before = fp.read_text(encoding="utf-8", errors="replace") if fp.exists() else None
+        if before is not None and before == content:      # 같은 내용을 다시 쓴 것: 바뀐 것이 없다고 그대로 알린다
+            return {"ok": True, "output": f"{r} already has exactly this content, so nothing was written and "
+                                          "nothing changed. Go on to the next step.", "changed": [], "stage": "same"}
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_bytes(content.encode("utf-8"))
         self.full_reads.add(r)
@@ -929,7 +1037,9 @@ class ToolBox:
         if not note:
             from .extras import lint_delta
             note = lint_delta(r, before, content)
-        return {"ok": True, "output": f"{r} 저장({len(content)}자)" + tag + note, "changed": [r], "syntax_error": syn}
+        echo = "" if before is None or self.edit_fails.get(r) else self._echo(rewrite_note(r, before, content))
+        return {"ok": True, "output": f"{r} 저장({len(content)}자)" + tag + note + echo, "changed": [r],
+                "syntax_error": syn}
 
     def t_apply_patch(self, patch: str) -> dict:
         """Codex apply_patch: 여러 파일을 한 번에. 모든 청크가 맞아야 쓴다(하나라도 실패하면 아무것도 안 바뀜)."""

@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-10
+
+### Added
+- Copied-lines note: when an `edit_file` call sends an `old` of eight or more lines and copies at least 70% of them unchanged into `new`, the edit is applied and the tool result then shows a shorter `old`/`new` that gives the same file. The harness shows it only after applying that shorter edit itself and getting an identical result. Rewriting a file of 20 or more lines with `write_file` while at least 80% of it stays the same gets a note to use `edit_file` with only the changed lines. Up to three notes per request; `CAP_ABLATION=no_echo` turns them off. It comes from a `qwen3.5-9b` trace where one import line was changed by sending almost the whole file once as `old` and once as `new` (about 640 tokens, 51 s). Checked with 21 unit tests only.
+
+### Changed
+- In an `edit_file` batch (`edits`), an item whose `old` and `new` are identical is skipped and the rest are applied; the result says which item was skipped. An item that is not found in the file still leaves the file untouched, as before. In the trace, a five-item batch (138 s to generate) was refused as a whole because of one such item.
+- A single edit with identical `old` and `new` answers "this changes nothing; if this part is already the way you want it, go on to the next step". It carries no closest-lines list and does not count as an edit failure.
+- `write_file` with exactly the content the file already has writes nothing and answers that the file already has this content.
+
 ## [0.13.0] - 2026-11-10
 
 ### Added

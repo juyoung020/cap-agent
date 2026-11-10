@@ -110,7 +110,7 @@ graph TD;
 - Also run on a copy of a real research repository (267 files, 53 tests); the problems found there were fixed.
 - Tests run on Windows and Linux (Python 3.11, 3.12) in GitHub Actions.
 - Other providers were tested against a fake OpenAI-compatible server, not with real keys.
-- 539 tests: `python -m pytest -q tests` (no API calls).
+- 560 tests: `python -m pytest -q tests` (no API calls).
 
 ## License
 

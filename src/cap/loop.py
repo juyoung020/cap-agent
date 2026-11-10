@@ -191,6 +191,7 @@ class LoopState(TypedDict, total=False):
     gap_nudged: bool         # 평가기 공백(요구사항 함수를 부르는 테스트 없음)으로 한 번 돌려보냈나
     file_hashes: dict        # CAP 이 마지막으로 읽거나 쓴 파일 내용의 해시(덮어쓰기 보호·안전한 /undo)
     edit_fails: dict         # 파일별 연속 편집 실패 수
+    echo_notes: int          # 이번 요청에서 '다시 쓴 줄' 안내를 붙인 횟수
     tool_hist: list          # 최근 도구 호출 [{key, name, ok, rh, progress}] — 반복 감지
     todos: list              # 모델의 할 일 목록(남은 항목이 있으면 끝내기 전에 한 번 묻는다)
     sub_instructions: list   # 이미 읽어 준 하위 폴더 지침 파일(AGENTS.md·CLAUDE.md)
@@ -517,7 +518,7 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
                 "changed": state.get("changed", []), "full_reads": state.get("full_reads", []),
                 "read_ranges": state.get("read_ranges", {}),
                 "preapproved_extra": state.get("preapproved_extra", []),
-                "file_hashes": state.get("file_hashes", {}), "edit_fails": {}, "tool_hist": [],
+                "file_hashes": state.get("file_hashes", {}), "edit_fails": {}, "echo_notes": 0, "tool_hist": [],
                 "todos": [], "todo_nudged": False, "stop_hook_active": False, "edit_versions": {},
                 "announce_nudged": False, "invalid_streak": 0}
 
@@ -927,6 +928,7 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
     def tools(state: LoopState) -> dict:
         box = ToolBox(ws, test_cmd=test_cmd or "python -m pytest -q", full_reads=set(state.get("full_reads", [])),
                       file_hashes=dict(state.get("file_hashes", {})), edit_fails=dict(state.get("edit_fails", {})),
+                      echo_notes=state.get("echo_notes", 0),
                       read_ranges=dict(state.get("read_ranges", {})),
                       sandbox=sandbox_now() if chat else "")
         hist = list(state.get("tool_hist", []))
@@ -1201,7 +1203,8 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
                "pass_seq": pass_seq, "changed": changed, "untested_edits": untested,
                "full_reads": sorted(box.full_reads), "read_ranges": box.read_ranges, "last_test_output": last_out,
                "turn_changed": turn_changed,
-               "file_hashes": box.file_hashes, "edit_fails": box.edit_fails, "tool_hist": hist, "todos": todos,
+               "file_hashes": box.file_hashes, "edit_fails": box.edit_fails, "echo_notes": box.echo_notes,
+               "tool_hist": hist, "todos": todos,
                "sub_tasks": sub_tasks, "sub_count": sub_count, "sub_instructions": loaded_inst,
                "loaded_tools": loaded_tools, "edit_versions": versions,
                **({"base_failures": base_now, "base_complete": base_ok} if base_now is not None else {})}
