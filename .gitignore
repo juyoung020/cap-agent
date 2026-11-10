@@ -1,9 +1,7 @@
 .env
 .cap/
+target/
 __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
-build/
-dist/
-*.egg-info/

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/cap-core", "crates/cap"]
+
+[workspace.package]
+version = "0.15.0-alpha.1"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/juyoung020/cap-agent"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

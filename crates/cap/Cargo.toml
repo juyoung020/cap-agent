@@ -1,0 +1,19 @@
+[package]
+name = "cap"
+description = "CAP (Code As Planned) — a terminal coding agent that only says done with evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cap"
+path = "src/main.rs"
+
+[dependencies]
+cap-core = { path = "../cap-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true

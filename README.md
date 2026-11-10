@@ -1,117 +1,140 @@
 # CAP — Code As Planned
 
-A terminal coding agent built on [LangGraph](https://github.com/langchain-ai/langgraph). It reads your code, edits it, runs commands and tests, and only says "done" after the tests actually pass. It works with any OpenAI-compatible model — OpenAI, Anthropic, Gemini, OpenRouter, or a local model in Ollama / LM Studio.
+A coding agent for small local models, written in Rust.
 
-CAP was designed and measured with a small model (a 9B model with a 16k context window), so it leans on guard rails instead of trusting the model: a permission table, approvals, an OS sandbox, checkpoints, and a test gate.
+**The model proposes; the code decides.** The model suggests the next step. Whether a file may be changed, whether a command may run, and whether the work is finished are decided by the harness. A run ends as *done* only when the project's tests pass.
 
-## Install
+Status: **alpha** (`0.15.0-alpha.1`). The core loop and the one-shot command `cap exec` work. The plan and what comes next are in [docs/PLAN.md](docs/PLAN.md); the principles are in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) (both in Korean).
 
-```powershell
-uv tool install git+https://github.com/juyoung020/cap-agent     # or: pipx install git+https://github.com/juyoung020/cap-agent
-cap setup            # choose a model provider, enter a key, pick a model — CAP makes one test call before saving
-cap sandbox setup    # one-time: command sandbox (Windows: AppContainer, no WSL, no admin)
-cd your-project
-cap
+## Build
+
+Rust 1.88 or newer.
+
+```sh
+git clone https://github.com/juyoung020/cap-agent
+cd cap-agent
+cargo build --release
 ```
 
-Python 3.10+ and git are needed. CAP is developed and tested on Windows 11; Linux works with the Landlock sandbox. macOS is not supported.
-
-| Provider (`cap setup`) | Key |
-|---|---|
-| `openai`, `anthropic`, `gemini`, `openrouter` | the provider's API key (or `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`) |
-| `ollama`, `lmstudio` | none — runs on your computer |
-| `custom` | any OpenAI-compatible URL (`CAP_CUSTOM_API_KEY`) |
-
-Keys are saved to `~/.cap/auth.json`, readable only by your account. Environment variables win over saved keys. Switch later with `cap setup` or `/provider` in the chat.
+The result is one executable: `target/release/cap` (`cap.exe` on Windows).
 
 ## Use
 
-Type a task: "fix the failing test in calc.py", "add a --verbose flag". CAP plans, reads files, edits, runs the tests, and reports.
-
-- **Modes** (Shift+Tab): `chat` (read only) · `ask` (approve each edit and command, default) · `plan` (plan first, then approve) · `auto` (only risky actions ask) · `bypass`.
-- **Approvals** appear in place of the input box: *Yes* · *Yes, don't ask again this session* · *Yes, don't ask again in this project* · *No, and tell CAP what to do instead*.
-- **Commands**: `/review` `/commit` `/undo` `/rewind` `/continue` `/resume` `/fork` `/compact` `/plan` `/goal` `/task` `/skills` `/mcp` `/plugins` `/permissions` `/sandbox` `/provider` `/config` `/doctor` … (`/help`).
-- **Long-running jobs**: `cap go "task" --detach --until 08:00` splits a spec into stages and works through them while you are away. Each stage gets a fresh context, writes and locks its tests first, retries with a different approach, re-checks earlier stages and commits on a work branch. Anything that needs you goes to a question box (`cap inbox`, optional phone notifications) while other stages keep running; the final report re-runs every check. `cap go status` shows one status line.
-- **Scripts and CI**: `cap exec "task"`, `--json` (one result line), `--events` (JSONL progress, like `codex exec --json`), `--schema file.json`, `--max-turns N`, `-o last.txt`, `cap exec resume last "follow-up"`.
-- **From another agent**: `cap mcp-server` exposes a `run_task` MCP tool. The repository is also a Claude Code / Codex plugin.
-
-Project instructions go in `CAP.md`, read like Claude Code's `CLAUDE.md`: `CAP.md` (shared), `CAP.local.md` (personal, keep it out of git), `~/.cap/CAP.md` (all projects), and `CAP.md` in subfolders when CAP first touches files there. `AGENTS.md` and `CLAUDE.md` are read too; CAP's own file comes last and wins.
-
-CAP reads Claude Code and Codex configuration in place: skills (`.claude/skills`, `~/.codex/skills`), commands, sub-agents, hooks (including `hookSpecificOutput` decisions), MCP servers (tools, resources, prompts) and plugins. Foreign hooks and MCP servers stay off until you enable them, and project-level ones need `/hooks trust` / `/mcp trust`.
-
-## Safety
-
-| Guard | What it does |
-|---|---|
-| Permission table | Every tool call is classified allow / ask / deny before it runs. Writing outside the workspace, reading secret files and destructive commands are refused in every mode. Agent instructions, existing tests and installs always need a human. |
-| Sandbox | Commands the model runs are isolated by the OS. **Windows**: AppContainer — reads and writes only inside the workspace, no network; the shell is `cmd.exe` (Git Bash and PowerShell do not start inside an AppContainer) with common Unix commands added by CAP (`ls cat head tail grep wc find rm cp mv mkdir -p touch diff`); `$VAR` is translated and multi-line commands, `python -c` bodies and heredocs are run line by line or from a file, but bash syntax such as `$(...)` or `for` loops is not available. **Linux**: Landlock — writes only in the workspace and `/tmp`, no TCP. Running something outside the sandbox always asks you. |
-| Test gate | Before a turn ends, the harness runs the project's tests itself. A failing test sends the output back to the model; "done" with failing tests is not accepted. After six code edits in a row without a test run, the harness also runs the tests mid-turn and appends the result to the tool output, at no extra model call. |
-| Checkpoints | Every graph step is checkpointed (SQLite). `/continue` resumes a turn that stopped midway (crash, error, Esc) from its last step; `/undo` and `/rewind` restore files from a shadow git snapshot. |
-| Secrets | Key-like values are masked in everything the model sees; secret files are never read. |
-
-## How it works
-
-Each request runs this LangGraph graph (generated from the compiled graph with `cap loop-graph`; dashed = conditional edges):
-
-```mermaid
----
-config:
-  flowchart:
-    curve: linear
----
-graph TD;
-	__start__([<p>__start__</p>]):::first
-	context(context)
-	agent(agent)
-	validate(validate)
-	permission(permission)
-	approval(approval)
-	checkpoint(checkpoint)
-	tools(tools)
-	verify_gate(verify_gate)
-	escalate(escalate)
-	subagent(subagent)
-	sub_join(sub_join)
-	__end__([<p>__end__</p>]):::last
-	__start__ --> context;
-	agent -.-> validate;
-	agent -.-> verify_gate;
-	approval -.-> agent;
-	approval -.-> checkpoint;
-	checkpoint --> tools;
-	context -.-> __end__;
-	context -.-> agent;
-	escalate -.-> __end__;
-	escalate -.-> agent;
-	permission -.-> agent;
-	permission -.-> approval;
-	permission -.-> checkpoint;
-	sub_join --> agent;
-	subagent --> sub_join;
-	tools -.-> agent;
-	tools -.-> escalate;
-	tools -.-> subagent;
-	validate -.-> escalate;
-	validate -.-> permission;
-	verify_gate -.-> __end__;
-	verify_gate -.-> agent;
-	verify_gate -.-> escalate;
-	classDef default fill:#f2f0ff,line-height:1.2
-	classDef first fill-opacity:0
-	classDef last fill:#bfb6fc
+```sh
+cap exec "inventory.remove() does not reject amounts above the stock. Fix it." -C path/to/project
 ```
 
-`approval` and `escalate` pause with `interrupt()` and resume with `Command(resume=…)`, so a pending approval survives a restart. `subagent` runs delegated tasks in parallel with `Send`.
+CAP reads the project, edits files, runs the tests and answers. The answer goes to stdout; progress goes to stderr, one short line per call and result, in this shape:
 
-## Status
+```
+> read_file {"path": "inventory.py"}
+  [ok] inventory.py lines 1-24 of 24
+> edit_file {"path": "inventory.py", "old": "…", "new": "…"}
+  [ok] inventory.py: lines 14-15 replaced (2 -> 4 lines)
+> run_tests {}
+= tests pass
 
-- Measured on Windows 11 with `qwen3.5-9b` (16k context): on 11 multi-file tasks (bugs whose cause is in another module, a feature across 6 files, API changes with hidden call sites, an 826-line file, refactoring), CAP passed 17 of 22 over two runs and handed the rest to a human, with no false "done"; a single model call without the agent loop passed 1 of 11 and returned broken code for the other 10. Prompt-injection and escape scenarios (10 cases): no harm with the sandbox on.
-- Compared with Aider 0.86.2 (Aider-AI) on the same model, four of those tasks, one run each: CAP 4/4, Aider 2/4 (the other two stopped at its limit of three fix attempts); neither reported a false "done". Four tasks and one run show a direction, not a margin.
-- Also run on a copy of a real research repository (267 files, 53 tests); the problems found there were fixed.
-- Tests run on Windows and Linux (Python 3.11, 3.12) in GitHub Actions.
-- Other providers were tested against a fake OpenAI-compatible server, not with real keys.
-- 560 tests: `python -m pytest -q tests` (no API calls).
+DONE — the tests pass
+changed: inventory.py
+4 steps · 19.4 s · 5145 tokens in, 236 out · 0 rejected "done"
+```
+
+### Options of `cap exec`
+
+| Option | Meaning |
+|---|---|
+| `-C, --dir <DIR>` | The project folder (default: the current folder) |
+| `--test <CMD>` | The command that decides whether the work is done |
+| `--no-test` | Run without a test command |
+| `--mode <read\|edit\|auto>` | What the agent may do (default `edit`) |
+| `--max-steps <N>` | Model calls before the run stops (default 30) |
+| `--provider <NAME>` | A name from `cap providers` (default `ollama`, env `CAP_PROVIDER`) |
+| `--model <NAME>` | The model name on that server (env `CAP_MODEL`) |
+| `--base-url <URL>` | Any OpenAI-compatible endpoint (env `CAP_BASE_URL`) |
+| `--context <TOKENS>` | The model's context window (env `CAP_CONTEXT`) |
+| `--json` | Print one JSON object with the result |
+| `--trace <FILE>` | Write the whole conversation as JSON lines |
+
+Without `--test`, CAP finds the test command from the project files: `cargo test` for `Cargo.toml`, `pytest` for Python projects, `npm test` for a `package.json` with a test script, `go test ./...` for `go.mod`.
+
+### Result and exit code
+
+| Headline | Status | Exit code |
+|---|---|---|
+| `DONE — the tests pass` | `verified` | 0 |
+| `ANSWERED` (a question, nothing changed) | `answered` | 0 |
+| `DONE, NOT VERIFIED` (files changed, the project has no tests) | `unverified` | 3 |
+| `NOT DONE` | `tests_fail`, `step_limit`, `stuck`, `model_failed`, `context_full` | 1 |
+| a setup or usage error | | 2 |
+
+When the model says it is finished, CAP runs the tests. If they fail, the failure output goes back to the model and the work continues. After four rejected "done" claims, or the same failure three times, the run ends as `tests_fail`.
+
+### Modes
+
+| Mode | Files | Commands |
+|---|---|---|
+| `read` | read only | read-only commands run; others ask first |
+| `edit` | edit inside the project | read-only commands and test runners run; others ask first |
+| `auto` | edit inside the project | ordinary commands run; network, package and git-history commands ask first |
+
+Fixed rules in every mode:
+
+- Paths outside the project are refused.
+- Files that hold keys (`.env`, `*.pem`, `.ssh/`, …) are refused for reading and writing, also when a command names them.
+- Destructive commands (`rm -rf`, `git reset --hard`, a forced push, …) are refused.
+- Changing an existing test file asks first.
+- Without a terminal to ask on, the answer to every question is no.
+
+Commands run as your user with the permission table above as the guard. Isolation by the operating system (Windows AppContainer, Linux Landlock) is phase 3 of the plan.
+
+## Model servers
+
+```
+$ cap providers
+name        model         context  key                 endpoint
+ollama      qwen3:8b         8192  none needed         http://localhost:11434/v1
+lmstudio    --model          8192  none needed         http://localhost:1234/v1
+kau         qwen3.5-9b      16384  KAU_API_KEY         https://agent.kau.ac.kr/v1
+openai      --model        128000  OPENAI_API_KEY      https://api.openai.com/v1
+anthropic   --model        200000  ANTHROPIC_API_KEY   https://api.anthropic.com/v1
+gemini      --model        128000  GEMINI_API_KEY      https://generativelanguage.googleapis.com/v1beta/openai
+openrouter  --model        128000  OPENROUTER_API_KEY  https://openrouter.ai/api/v1
+```
+
+The key is read from the provider's environment variable or from `CAP_API_KEY`.
+
+```sh
+cap exec "add a --verbose flag" --provider ollama --model qwen3:8b
+cap exec "why does test_login fail?" --mode read --provider openai --model <model>
+cap exec "fix the failing test" --base-url http://localhost:8000/v1 --model my-model --context 16384
+```
+
+**Context on local servers.** Ollama and LM Studio load a model with a small context window unless told otherwise. CAP assumes 8192 tokens for them, so set the server to at least that (`OLLAMA_CONTEXT_LENGTH` or `num_ctx` for Ollama, the context length setting in LM Studio). When you set a larger window, pass the same number with `--context`.
+
+## What is tested
+
+- 75 unit and integration tests (`cargo test --workspace`) on Windows and Linux: the loop against a scripted model, the tools, the permission table, the test verdicts, context fitting, and the HTTP client against a local mock server.
+- One real run against `qwen3.5-9b` on the KAU server: a one-file bug fix, 4 model calls, 19 s, tests passing afterwards.
+- The other provider entries are checked against the mock server only.
+- A comparison with other agents on the same model and tasks is phase 6 of the plan; no comparison has been measured yet.
+
+## Layout
+
+```
+crates/cap-core   the agent as a library: loop, tools, edit, gate, permissions, context, model client
+crates/cap        the command line program
+docs/             plan and principles
+archive/python    the Python version (0.8.0 – 0.14.0)
+```
+
+## The Python version
+
+CAP 0.14.0 and earlier were written in Python. That version stays installable from its tag, and its sources are under [archive/python](archive/python):
+
+```sh
+uv tool install git+https://github.com/juyoung020/cap-agent@v0.14.0
+```
 
 ## License
 
-[Apache License 2.0](LICENSE)
+Apache-2.0. See [LICENSE](LICENSE).

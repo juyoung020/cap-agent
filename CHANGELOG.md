@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+CAP is being rewritten in Rust (`0.15.0-alpha.1`). The Python version ends at 0.14.0 and stays installable from the tag `v0.14.0`.
+
+### Added
+- Rust workspace with two crates: `cap-core` (the agent as a library) and `cap` (the command line program, one executable).
+- `cap exec "task"`: run one task in a project folder and exit. Options `-C`, `--test`, `--no-test`, `--mode read|edit|auto`, `--max-steps`, `--json`, `--trace`, `--provider`, `--model`, `--base-url`, `--context`. Exit code 0 for `verified` and `answered`, 3 for `unverified`, 1 for an unfinished run, 2 for a setup error.
+- `cap providers`: the model servers known by name — Ollama (default), LM Studio, KAU, OpenAI, Anthropic, Gemini, OpenRouter — all through the OpenAI-compatible format. The key comes from the provider's environment variable or `CAP_API_KEY`.
+- The loop: a reply without a tool call counts as a "done" claim and the tests decide. Failing output goes back to the model; four rejected claims or the same failure three times end the run as `tests_fail`. A passing result is reused until a file changes or a command other than a read-only one runs.
+- Seven tools: `read_file`, `list_files`, `search`, `edit_file`, `write_file`, `run_tests`, `run`. Tool and argument names used by other agents are accepted.
+- Help for small models: broken arguments are explained, a call that failed twice with the same arguments is cut short, an unchanged file is not sent twice, an announcement ("I will now fix…") is told apart from an answer, empty and cut-off replies are retried, and tool calls written out as text are read as calls.
+- Permission table with three modes. Paths outside the project, files that hold keys and destructive commands are refused in every mode; network, package and git-history commands ask first; changing an existing test file asks first.
+- Test verdicts for Cargo, pytest, npm and Go projects, with the test command found from the project files.
+- Context fitting: token estimate corrected by the server's own count, old tool output shortened first, then the oldest rounds dropped.
+- HTTP client: retries on 429 and server errors, errors told apart (refused key, missing model, full context, busy server, unreachable server), the key removed from error text, `<think>` text removed.
+- `docs/PLAN.md` (phases and what "better than other agents" will mean) and `docs/PHILOSOPHY.md` (the five principles).
+- 75 tests (48 unit, 21 loop tests against a scripted model, 6 HTTP tests against a local mock server), passing on Windows and Linux. One real run against `qwen3.5-9b` on the KAU server (a one-file bug fix: 4 model calls, 19.4 s, 5145 tokens in, 236 out, tests passing afterwards). No comparison with other agents has been measured for the Rust version.
+
+### Changed
+- The Python sources, tests, plugin files and documents moved to `archive/python`.
+- CI builds, tests, formats and lints the Rust workspace on Ubuntu and Windows.
+
+### Removed
+- The PyPI release workflow.
+
 ## [0.14.0] - 2026-11-10
 
 ### Added
@@ -103,7 +126,8 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Fixed
 - Windows sandbox: in an environment installed with uv or pipx, Python inside the sandbox could not read its packages (hard-linked cache files do not inherit folder permissions, so each file is granted access).
 
-[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/juyoung020/cap-agent/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/juyoung020/cap-agent/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/juyoung020/cap-agent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/juyoung020/cap-agent/compare/v0.10.2...v0.11.0
