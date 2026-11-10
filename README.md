@@ -4,6 +4,10 @@ A coding agent for small local models, written in Rust.
 
 **The model proposes; the code decides.** The model suggests the next step. Whether a file may be changed, whether a command may run, and whether the work is finished are decided by the harness. A run ends as *done* only when the project's tests pass.
 
+![cap exec fixes a one-line bug: it reads the file, runs the tests, replaces one line, and the tests pass](docs/demo.gif)
+
+<sub>One real run on Linux with `qwen3.5-9b` on the KAU server, commands isolated by Landlock. Pauses longer than 3 s are cut to 3 s; the run took 22.6 s.</sub>
+
 Status: **alpha** (`0.15.0-alpha.1`). The conversation (`cap`), the one-shot command (`cap exec`), isolation of commands by the operating system, skills, MCP servers and the settings file work and are covered by tests. How much each part helps a real model is not measured yet. The plan is in [docs/PLAN.md](docs/PLAN.md); the principles are in [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) (both in Korean).
 
 ## Build
@@ -218,7 +222,7 @@ cap exec "fix the failing test" --base-url http://localhost:8000/v1 --model my-m
 ## What is tested
 
 - 153 tests on Windows and 152 on Linux (`cargo test --workspace`): the tools, line edits, the permission table, the test verdicts, context fitting, the code map, the board, skills, the MCP protocol, the settings file, the loop and whole conversations against a scripted model, the HTTP client against a local mock server, and the isolation against real commands (Landlock on Linux, AppContainer on Windows).
-- Single trial runs with `qwen3.5-9b` on the KAU server, isolation off: the one-line bug fix above (4 model calls; 17.9 s and 25.1 s in two runs) and a piped conversation with one question and the slash commands.
+- Single trial runs with `qwen3.5-9b` on the KAU server: the one-line bug fix above on Windows with isolation off (4 model calls; 17.9 s and 25.1 s in two runs), the same fix on Linux with Landlock isolation (4 model calls, 22.6 s; the recording at the top), and a piped conversation with one question and the slash commands.
 - The other provider entries are checked against the mock server only. MCP is checked with the protocol tests; no outside MCP server has been run with it.
 - The effect of each feature on a real model has not been measured. A comparison with other agents on the same model and tasks is phase 6 of the plan and has not been run.
 
