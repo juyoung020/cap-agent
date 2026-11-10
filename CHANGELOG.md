@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-10
+
+### Added
+- Mid-run test check: after six code edits in a row without a test run, the harness runs the tests itself and appends the result (pass or fail, failing test names, output) to that tool result. It costs no extra model call. Documentation edits are not counted, and the count restarts when the model runs the tests.
+- Comparison with another agent on the same model, tasks and grading (measured in the source repo): Aider 0.86.2 (Aider-AI) with `qwen3.5-9b`, four tasks, one run each. CAP solved 4/4, Aider 2/4 (the other two stopped at its limit of three fix attempts); neither reported a false "done".
+- Re-measured after the change (source repo, two tasks, one run): `tier` passed with the same 13 model calls and 187 s as before, with one mid-run check in between. `dedup` did not finish within the 15-minute limit; it was unsolved before the change as well.
+
+### Fixed
+- Windows sandbox shell: a multi-line command ran only its first line and came back empty. Lines now run in order, and the body of a multi-line `python -c "..."` or a heredoc (`<<EOF`) is moved to a file under `.cap/sbx/inline/` and run from there. Other multi-line quoted arguments are refused with the reason.
+
 ## [0.12.0] - 2026-11-08
 
 ### Added
@@ -31,6 +41,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Fixed
 - Global options written after `exec` (`cap exec --mode auto "task"`) were taken as part of the task.
 - `cap exec` without a terminal (scripts, CI) waited forever for an approval answer; it now declines right away and says so.
+- Windows sandbox: the file used in place of NUL is now cleaned up in the right place (TEMP inside the sandbox is a sandbox-only folder that Windows provides).
 
 ## [0.10.1] - 2026-11-06
 
@@ -73,12 +84,17 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 - First public release.
-- `cap setup`: choose a model provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, LM Studio, custom), save the key after a successful test call.
+- `cap setup` (`cap login`): choose a model provider (OpenAI, Anthropic, Gemini, OpenRouter, Ollama, LM Studio, custom), save the key after a successful test call (`~/.cap/auth.json`, readable by your account only).
+- `cap sandbox [status|setup|setup wsl|undo]` and `cap --version`.
 - Windows command sandbox with AppContainer (no WSL, no admin); Linux sandbox with Landlock.
 - LangGraph coding loop with permission table, approvals, checkpoints (`/continue`), test gate, sub-agents.
 - Claude Code / Codex compatibility: skills, commands, sub-agents, hooks, MCP (tools, resources, prompts), plugins.
 
-[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.12.0...HEAD
+### Fixed
+- Windows sandbox: in an environment installed with uv or pipx, Python inside the sandbox could not read its packages (hard-linked cache files do not inherit folder permissions, so each file is granted access).
+
+[Unreleased]: https://github.com/juyoung020/cap-agent/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/juyoung020/cap-agent/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/juyoung020/cap-agent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/juyoung020/cap-agent/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/juyoung020/cap-agent/compare/v0.10.1...v0.10.2

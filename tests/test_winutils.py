@@ -221,6 +221,48 @@ def test_translate():
     assert t("ls | grep x || dir") == "ls | grep x || cap-dir"
 
 
+def test_flatten_joins_lines(tmp_path):
+    f = lambda cmd: W.flatten(cmd, str(tmp_path / "inline"))        # noqa: E731
+    assert f("python -m pytest -q") == "python -m pytest -q"        # 한 줄은 그대로
+    assert f("echo a\necho b\r\n\n# note\necho c\n") == "echo a & echo b & echo c"
+    assert f("cd src &&\npython x.py") == "cd src && python x.py"
+    assert f("ls src | \\\n  head -2") == "ls src |   head -2"
+    assert f("grep x a.txt ||\necho none") == "grep x a.txt || echo none"
+    assert f('echo "one line" \necho \'two\'') == 'echo "one line" & echo \'two\''
+    assert f("echo it's\necho fine") == "echo it's & echo fine"     # 단어 안의 ' 는 따옴표가 아니다
+    assert not (tmp_path / "inline").exists()                       # 파일로 옮길 것이 없으면 폴더도 만들지 않는다
+
+
+def test_flatten_moves_multiline_python_to_a_file(tmp_path):
+    d = tmp_path / "inline"
+    got = W.flatten('cd src &&\npython -c "\nimport sys\nprint(\\"q\\", 1)\n" | head -1', str(d))
+    files = sorted(d.glob("*.py"))
+    assert len(files) == 1 and files[0].read_text(encoding="utf-8") == '\nimport sys\nprint("q", 1)\n'
+    path = str(files[0]).replace("\\", "/")
+    assert got == f"cd src && python -c \"exec(open('{path}', encoding='utf-8').read())\" | head -1"
+    got = W.flatten("python3 -X utf8 -c '\nprint(\"sq\")\n'", str(d))           # 작은따옴표 본문은 글자 그대로
+    assert "exec(open(" in got and any(p.read_text(encoding="utf-8") == '\nprint("sq")\n' for p in d.glob("*.py"))
+    assert W.flatten('python -c "print(1)"\npython -c "print(2)"', str(d)) == 'python -c "print(1)" & python -c "print(2)"'
+
+
+def test_flatten_heredoc_becomes_a_stdin_file(tmp_path):
+    d = tmp_path / "inline"
+    got = W.flatten("python - <<'EOF'\nimport os\nprint(1)\nEOF\necho done", str(d))
+    files = sorted(d.glob("*.txt"))
+    assert len(files) == 1 and files[0].read_text(encoding="utf-8") == "import os\nprint(1)\n"
+    assert got == f'python - < "{files[0]}" & echo done'
+    got = W.flatten("cat <<-END > note.txt\n\tline one\n\tline two\n\tEND", str(d))
+    body = [p for p in d.glob("*.txt") if p.read_text(encoding="utf-8") == "line one\nline two\n"]
+    assert len(body) == 1 and got == f'cat < "{body[0]}" > note.txt'
+
+
+def test_flatten_refuses_other_multiline_arguments(tmp_path):
+    got = W.flatten('git commit -m "first\n\nsecond"', str(tmp_path / "inline"))
+    assert got.startswith("echo [cmd.exe] this command was not run") and got.endswith("exit /b 2")
+    assert not (tmp_path / "inline").exists()
+    assert W.flatten('echo "open\necho b', str(tmp_path / "inline")) == 'echo "open\necho b'    # 안 닫힌 따옴표는 그대로
+
+
 def test_install_writes_shims_and_sandbox_env_puts_bin_first(tmp_path):
     from cap import appcontainer_exec as A
     b = tmp_path / "bin"
@@ -242,6 +284,8 @@ def test_shell_args_translates_for_appcontainer_only(tmp_path, monkeypatch):
     monkeypatch.setattr(sb, "wrap", lambda inner, cwd, b, timeout=None: (seen.append(inner) or ["x"], ""))
     T.shell_args("mkdir -p a/b && dir", tmp_path, "appcontainer")
     assert seen[-1].endswith("&& cap-mkdir -p a/b && cap-dir")
+    T.shell_args("mkdir -p a/b\ndir", tmp_path, "appcontainer")              # 여러 줄은 한 줄로(cmd.exe 는 첫 줄만 돌린다)
+    assert seen[-1].endswith("&& cap-mkdir -p a/b & cap-dir") and "\n" not in seen[-1]
     T.shell_args("mkdir -p a/b && dir", tmp_path, "landlock")
     assert seen[-1].endswith("mkdir -p a/b && dir") and "cap-" not in seen[-1]
 
@@ -294,5 +338,11 @@ def test_real_appcontainer_unix_commands(tmp_path):
         assert code == 0 and out.split() == ["3", "1"], out
         code, out = sh("head -n 1 x.txt; wc -l x.txt; pwd")
         assert code == 0 and out.split("\n")[:3] == ["alpha", "3 x.txt", str(ws.resolve())], out
+        code, out = sh('python -c "\nimport sys\nfor i in range(2):\n    print(i, sys.path[0] == \\"\\")\n"\necho after')
+        assert code == 0 and out.splitlines()[:3] == ["0 True", "1 True", "after"], out     # 여러 줄 python -c + 다음 줄
+        code, out = sh("python - <<'EOF'\nprint(open('x.txt').read().split()[0])\nEOF")
+        assert code == 0 and out.strip() == "alpha", out
+        code, out = sh('git commit -m "first\n\nsecond"')
+        assert code == 2 and "this command was not run" in out, out
     finally:
         assert "Removed" in S.appc_undo(ws)

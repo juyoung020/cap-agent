@@ -601,7 +601,8 @@ def shell_args(cmd: str, cwd: Path, sandbox: str = "", timeout: int | None = Non
         from . import sandbox as sb
         inner = cmd
         if sandbox == "appcontainer":          # Windows 격리: cmd.exe, venv 파이썬이 먼저 잡히게
-            from .winutils import translate    # mkdir -p·dir·export·/dev/null 같은 bash 습관을 cmd 로(유닉스 명령은 .cap/sbx/bin)
+            from .winutils import flatten, translate   # mkdir -p·dir·export·/dev/null 같은 bash 습관을 cmd 로(유닉스 명령은 .cap/sbx/bin)
+            cmd = flatten(cmd, str(cwd.resolve() / ".cap" / "sbx" / "inline"))     # cmd.exe 는 첫 줄만 돌린다 → 한 줄로
             # chcp 결과는 NUL 대신 격리 임시 폴더의 파일로(NUL 을 못 여는 컴퓨터가 있다), 실패해도 명령은 돈다
             inner = f'chcp 65001 >"%TEMP%\\cap-devnull" 2>&1 & set "PATH={first};%PATH%{";" + last if last else ""}" && {translate(cmd)}'
         elif sandbox != "wsl" and bash:          # 리눅스: venv 파이썬이 먼저 잡히게(WSL 은 리눅스 쪽 도구를 쓴다)
@@ -613,6 +614,9 @@ def shell_args(cmd: str, cwd: Path, sandbox: str = "", timeout: int | None = Non
     if bash:                                     # Git Bash 에서 venv 파이썬이 먼저 잡히도록
         full = f'export PATH="{_bash_path(first)}:$PATH{":" + _bash_path(last) if last else ""}"; {cmd}'
         return [bash, "-c", full], False, ""
+    if os.name == "nt":                          # Git Bash 없는 Windows: cmd.exe 가 받는다(여러 줄은 한 줄로)
+        from .winutils import flatten
+        cmd = flatten(cmd, str(cwd.resolve() / ".cap" / "sbx" / "inline"))
     return cmd, True, ""
 
 

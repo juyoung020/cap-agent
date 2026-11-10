@@ -1032,6 +1032,114 @@ def translate(line: str) -> str:
     return "".join(x[1] for x in t)
 
 
+_PY_C = re.compile(r"(?:^|[\s&|;(])(?:python[\d.]*|py)(?:\.exe)?(?:\s+(?:-[XW]\s+\S+|-[A-Za-z]\S*))*\s+-c\s+$")
+_HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+_JOINERS = ("&&", "||", "|", "&", "(")
+MULTILINE_ARG = ("[cmd.exe] this command was not run: a quoted argument spans several lines, and cmd.exe cannot pass "
+                 "that. Put the text in a file with write_file and pass the file, or use one line.")
+
+
+def flatten(cmd: str, inline_dir: str) -> str:
+    """여러 줄 명령을 cmd.exe 가 받는 한 줄로 옮긴다(cmd.exe 는 첫 줄만 돌리고 나머지를 말없이 버린다).
+    - 따옴표 밖의 줄바꿈: 차례로 실행(`a & b`). 줄 끝의 역슬래시 · `&&` · `||` · `|` 는 다음 줄과 잇는다. `#` 줄은 뺀다.
+    - `python -c "여러 줄"`: 본문을 inline_dir 의 파일로 두고 `python -c "exec(open(...).read())"` 로(작업 폴더 기준 import 유지).
+    - `명령 <<'EOF' … EOF`: 본문을 파일로 두고 `명령 < 파일`.
+    - 그 밖의 여러 줄 따옴표 인자: 옮길 방법이 없어, 이유를 출력하고 exit 2 로 끝나는 명령으로 바꾼다."""
+    src = cmd.replace("\r\n", "\n").strip()
+    if "\n" not in src:
+        return cmd
+
+    def save(text: str, ext: str) -> str:
+        import hashlib
+        import time
+        os.makedirs(inline_dir, exist_ok=True)
+        now = time.time()
+        for old in os.listdir(inline_dir):                  # 한 시간 지난 조각은 치운다
+            q = os.path.join(inline_dir, old)
+            try:
+                if now - os.path.getmtime(q) > 3600:
+                    os.remove(q)
+            except OSError:
+                pass
+        data = text.encode("utf-8")
+        path = os.path.join(inline_dir, hashlib.sha1(data).hexdigest()[:12] + ext)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    lines: list[str] = []
+    cur = ""
+    docs: list[tuple[str, bool, str]] = []       # 본문을 기다리는 heredoc: (끝 표시, 탭 떼기, 자리 표시)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "\\" and src[i + 1:i + 2] == "\n":          # 줄 잇기
+            i += 2
+            continue
+        if c == "\n":
+            i += 1
+            for tag, dash, mark in docs:
+                body: list[str] = []
+                while i < n:
+                    j = src.find("\n", i)
+                    line = src[i:] if j < 0 else src[i:j]
+                    i = n if j < 0 else j + 1
+                    if line.strip() == tag:
+                        break
+                    body.append(line.lstrip("\t") if dash else line)
+                cur = cur.replace(mark, '< "' + save("\n".join(body) + "\n", ".txt") + '"')
+            docs = []
+            lines.append(cur)
+            cur = ""
+            continue
+        if c == '"' or (c == "'" and (not cur or cur[-1] in " \t=(")):
+            j = i + 1
+            if c == '"':
+                while j < n and src[j] != '"':
+                    j += 2 if src[j] == "\\" else 1
+            else:
+                j = src.find("'", j)
+                j = n if j < 0 else j
+            if j >= n:                                       # 닫히지 않은 따옴표: 그대로 두어 셸 오류가 보이게
+                cur += src[i:]
+                break
+            seg = src[i:j + 1]
+            if "\n" in seg:
+                if not _PY_C.search(cur):
+                    return "echo " + MULTILINE_ARG + " 1>&2 & exit /b 2"
+                body_text = seg[1:-1]
+                if c == '"':
+                    body_text = re.sub(r'\\(["\\$`])', r"\1", body_text)      # bash 큰따옴표 안의 \" \\ \$ \`
+                path = save(body_text, ".py").replace("\\", "/").replace("'", "\\'")
+                seg = f"\"exec(open('{path}', encoding='utf-8').read())\""
+            cur += seg
+            i = j + 1
+            continue
+        m = _HEREDOC.match(src, i) if c == "<" else None
+        if m:
+            mark = f"\x00{len(docs)}\x00"
+            docs.append((m.group(3), bool(m.group(1)), mark))
+            cur += mark
+            i = m.end()
+            continue
+        cur += c
+        i += 1
+    for _, _, mark in docs:                                  # 본문 없이 끝난 heredoc
+        cur = cur.replace(mark, "< NUL")
+    lines.append(cur)
+    out = ""
+    for ln in (x.strip() for x in lines):
+        if not ln or ln.startswith("#"):
+            continue
+        if not out:
+            out = ln
+        elif out.endswith(_JOINERS):
+            out += " " + ln
+        else:
+            out += " & " + ln
+    return out
+
+
 # ---------------------------------------------------------------- 격리 폴더에 깔기
 def install(bin_dir: str, python: str) -> str:
     """bin_dir 에 winutils.py 사본과 명령마다 .cmd 를 둔다(내용이 같으면 다시 쓰지 않음). bin_dir 을 돌려준다."""

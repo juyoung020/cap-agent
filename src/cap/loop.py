@@ -102,6 +102,7 @@ ASK_USER_SCHEMA = {"type": "function", "function": {
         "options": {"type": "array", "items": {"type": "string"}, "maxItems": 4}}, "required": ["question"]}}}
 CHAT_TOOL_SCHEMAS = list(TOOL_SCHEMAS)       # 대화형에도 report_conflict(테스트가 요청과 모순이면 사람에게)
 CHAT_TOOL_NAMES = {t["function"]["name"] for t in CHAT_TOOL_SCHEMAS}
+UNTESTED_EDITS = 6           # 테스트 없이 이어진 편집이 이만큼이면 하네스가 테스트를 돌려 결과를 알려 준다
 CHAT_MAX_VERIFY = 3          # 하네스가 테스트 실패를 돌려보내는 횟수(Hermes verify-on-stop 2회보다 1회 여유)
 DENIAL_BREAKER = 3           # 연속 거부 3회 → 멈추고 보고하라(Hermes 06 §6-2 denial_breaker_threshold)
 BUDGET_WARN_AT = 0.8         # 턴 예산 80% 에서 한 번 알림(Hermes 02 §2)
@@ -118,8 +119,8 @@ WIN_RUN_SCHEMA = {"type": "function", "function": {
                     "workspace, has no network, and other folders are invisible. Unix basics work here: "
                     "`ls cat head tail grep wc find rm cp mv mkdir -p touch pwd which`, `sed -n 'A,Bp' file`, "
                     "`diff -u a b`, pipes, `&&`, `> file`, `python ...`, `python -m pytest -q`, `git ...`. "
-                    "`$VAR` becomes %VAR%. Bash-only syntax does not work: no `$(...)`, `for` loops, `[[ ]]` or "
-                    "heredocs. Edit files with edit_file, not sed. "
+                    "`$VAR` becomes %VAR%. Bash-only syntax does not work: no `$(...)`, `for` loops or `[[ ]]`. "
+                    "Several lines run one after another, and a multi-line `python -c \"...\"` works. Edit files with edit_file, not sed. "
                     "Set background=true for servers or watchers. If something truly needs more, retry with "
                     "escalate=true (the user is asked)."),
     "parameters": {"type": "object", "properties": {
@@ -178,6 +179,7 @@ class LoopState(TypedDict, total=False):
     base_failures: list      # chat: 턴 시작 시점에 이미 실패하던 테스트(None = 아직 안 잼)
     base_complete: bool      # chat: 그 기준선이 모든 테스트를 돌려 본 것인가(수집 오류 등으로 못 돌린 게 없나)
     baseline_nudged: bool
+    untested_edits: int      # chat: 마지막 테스트 실행 뒤로 코드 파일을 바꾼 횟수
     carry_note: str          # chat: 다음 사용자 메시지 앞에 붙일 말(압축 요약, /undo 알림)
     verify_note: str         # chat: 화면에 보일 검증 결과 한 줄
     full_reads: list
@@ -509,7 +511,7 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
         return {"messages": msgs, "turns": 0, "verify_tries": 0, "fail_sigs": {}, "status": "running",
                 "turn_no": turn_no, "turn_log": log, "turn_changed": [], "carry_note": "", "denials": 0,
                 "base_failures": None, "base_complete": True, "baseline_nudged": False, "verify_note": "",
-                "pending": [], "summary": "",
+                "pending": [], "summary": "", "untested_edits": 0,
                 "edit_seq": state.get("edit_seq", 0), "pass_seq": state.get("pass_seq", -1),
                 "cp_no": state.get("cp_no", 0), "checkpoints": state.get("checkpoints", []),
                 "changed": state.get("changed", []), "full_reads": state.get("full_reads", []),
@@ -933,6 +935,7 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
         msgs = list(state["messages"])
         images: list[tuple[str, str]] = []          # read_file 로 연 그림 → 도구 결과 뒤 사용자 행으로
         edit_seq, pass_seq = state.get("edit_seq", 0), state.get("pass_seq", -1)
+        untested = state.get("untested_edits", 0)
         changed = list(state.get("changed", []))
         turn_changed = list(state.get("turn_changed", []))
         status, last_out = state.get("status", "running"), state.get("last_test_output", "")
@@ -1075,6 +1078,8 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
             out = res.get("output", "")
             if res.get("changed"):
                 edit_seq += 1
+                if any(not f.lower().endswith(DOC_EXT) for f in res["changed"]):
+                    untested += 1
                 for f in res["changed"]:
                     if f not in changed:
                         changed.append(f)
@@ -1096,6 +1101,7 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
                 ledger.log("test", source="agent", cmd=res.get("cmd") or c["args"].get("cmd"), exit=res.get("exit"),
                            passed=ok, edit_seq=edit_seq)
                 say(f"테스트(모델 실행): {'통과' if ok else '실패'}")
+                untested = 0
                 if ok and (res.get("cmd") or "").strip() == test_cmd.strip():
                     pass_seq = edit_seq
                 elif ok and chat and cmp.is_full_test_run(res.get("cmd") or c["args"].get("cmd", ""), test_cmd):
@@ -1164,11 +1170,35 @@ def build_loop(*, ws: Path, ledger: Ledger, test_cmd: str, frozen: set[str], pre
                 images.append((c["args"].get("path", ""), res["image"]))
             if chat and res.get("images"):
                 images.extend(res["images"])
+        mine = [m for m in msgs[len(state["messages"]):] if m.get("role") == "tool"]
+        if (chat and test_cmd and mine and untested >= UNTESTED_EDITS and "no_gate" not in ABLATION
+                and not conflict and not stuck):
+            # 테스트 없이 고치기만 이어지면(작은 모델이 틀린 방향으로 한도까지 감) 하네스가 돌려 결과를 도구 결과 뒤에 붙인다.
+            # 모델 호출은 늘지 않는다. 끝낼 때의 검증 관문과는 별개(그건 그대로 돈다).
+            with busy("테스트 확인 중"):
+                code, t_out = run_shell(test_cmd, ws, sandbox=sandbox_now())
+            summ = cmp.test_summary(t_out, code)
+            ledger.log("test", source="harness_mid", cmd=test_cmd, exit=code, passed=code == 0, edit_seq=edit_seq,
+                       untested=untested, output=clip(t_out, 1500))
+            say(f"테스트(중간 확인): {'통과' if code == 0 else '실패'}")
+            if code == 0:
+                pass_seq = edit_seq
+                mine[-1]["content"] += (f"\n[harness] You made {untested} edits without running the tests, so the harness "
+                                        f"ran them: {summ}.")
+            elif code != 5 and "no tests ran" not in t_out:
+                failing_now = cmp.failing_tests(t_out, code)
+                mine[-1]["content"] += (
+                    f"\n[harness] You made {untested} edits without running the tests, so the harness ran `{test_cmd}`: "
+                    f"{summ}. Failing: {', '.join(failing_now[:8])}. If they fail only because your change is not "
+                    "finished yet, finish it. Otherwise fix these before editing further, and call run_tests after each "
+                    "fix.\n" + clip(t_out, 1500))
+                last_out = t_out
+            untested = 0
         if images:      # 도구 결과에는 그림을 못 넣으므로 바로 뒤 사용자 행으로(with_images 가 그림으로 바꾼다)
             msgs.append({"role": "user", "content": "[harness] Images you opened with read_file:\n" + "\n".join(
                 f"--- @{p} (image) ---\n[[image:{a}]]" for p, a in images)})
         upd = {"messages": fixed_note(state, msgs, len(state["messages"])), "pending": [], "edit_seq": edit_seq,
-               "pass_seq": pass_seq, "changed": changed,
+               "pass_seq": pass_seq, "changed": changed, "untested_edits": untested,
                "full_reads": sorted(box.full_reads), "read_ranges": box.read_ranges, "last_test_output": last_out,
                "turn_changed": turn_changed,
                "file_hashes": box.file_hashes, "edit_fails": box.edit_fails, "tool_hist": hist, "todos": todos,
