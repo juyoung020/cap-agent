@@ -45,6 +45,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          # A runner that cannot isolate a command fails the isolation tests instead of skipping them.
+          CAP_REQUIRE_SANDBOX: "1"
       - name: Release build
         run: cargo build --release --locked
 

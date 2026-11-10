@@ -12,7 +12,8 @@ pub const KEEP_RECENT: usize = 6;
 pub const MIN_OUTPUT: u32 = 512;
 /// Tokens left unused so an estimate that is slightly low does not overflow the window.
 pub const MARGIN: u32 = 600;
-const STUB: &str = "[dropped to save context: ";
+/// How the content of a stubbed tool result starts.
+pub const STUB: &str = "[dropped to save context: ";
 
 /// Rough token count of a text: ASCII is about 3.5 characters per token, other scripts cost more.
 pub fn estimate_text(text: &str) -> u32 {
@@ -33,7 +34,7 @@ pub fn estimate_messages(msgs: &[Message]) -> u32 {
 }
 
 pub fn estimate_tools(tools: &[ToolSpec]) -> u32 {
-    tools.iter().map(|t| estimate_text(t.name) + estimate_text(t.description) + estimate_text(&t.parameters.to_string()) + 12).sum()
+    tools.iter().map(|t| estimate_text(&t.name) + estimate_text(&t.description) + estimate_text(&t.parameters.to_string()) + 12).sum()
 }
 
 /// Correction factor learned from the server's own count of the last prompt.

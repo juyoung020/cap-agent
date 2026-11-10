@@ -1,5 +1,8 @@
 //! Running a shell command with a time limit and a bounded, UTF-8 output.
+//!
+//! A command that is dropped before it ends (time limit, Ctrl-C) takes every process it started with it.
 
+use crate::sandbox::Sandbox;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -22,6 +25,10 @@ pub struct Output {
 impl Output {
     pub fn ok(&self) -> bool {
         self.code == Some(0)
+    }
+
+    fn not_started(why: String) -> Output {
+        Output { code: None, text: why, timed_out: false, seconds: 0.0 }
     }
 }
 
@@ -49,27 +56,94 @@ fn command(cmd: &str) -> Command {
     {
         let mut c = Command::new("sh");
         c.arg("-c").arg(cmd);
+        // Its own process group: the shell and everything it starts can be stopped together.
+        c.process_group(0);
         c
     }
 }
 
+/// The processes of a running command; dropping it while they run stops them all.
+struct Tree(Option<u32>);
+
+impl Tree {
+    fn stop(pid: u32) {
+        #[cfg(unix)]
+        // SAFETY: a signal to the process group this module created for the command.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            // `cmd` starts the real program as a child; `taskkill /T` ends the whole tree.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = pid;
+    }
+
+    fn ended(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            Tree::stop(pid);
+        }
+    }
+}
+
 async fn kill_tree(child: &mut tokio::process::Child) {
-    #[cfg(windows)]
     if let Some(pid) = child.id() {
-        // `cmd` starts the real program as a child; kill the whole tree.
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+        #[cfg(not(windows))]
+        Tree::stop(pid);
     }
     let _ = child.kill().await;
 }
 
-/// Run `cmd` in `cwd` through the system shell.
+/// Turn what a command printed into the text the model reads.
+fn finish(out: &[u8], err: &[u8], code: Option<i32>, timed_out: bool, timeout: Duration, started: Instant) -> Output {
+    let mut text = String::from_utf8_lossy(out).replace("\r\n", "\n");
+    let err = String::from_utf8_lossy(err).replace("\r\n", "\n");
+    if !err.trim().is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&err);
+    }
+    if timed_out {
+        text.push_str(&format!("\n[stopped: no result within {} s]", timeout.as_secs()));
+    }
+    Output { code, text: clip(text.trim_end(), HEAD, TAIL), timed_out, seconds: started.elapsed().as_secs_f32() }
+}
+
+/// Run `cmd` in `cwd` through the system shell, without isolation.
 pub async fn shell(cmd: &str, cwd: &Path, timeout: Duration) -> Output {
+    shell_in(&Sandbox::Off, cmd, cwd, timeout).await
+}
+
+/// Run `cmd` in `cwd` through the system shell, inside `sandbox` when it is on.
+pub async fn shell_in(sandbox: &Sandbox, cmd: &str, cwd: &Path, timeout: Duration) -> Output {
     let started = Instant::now();
+    #[cfg(windows)]
+    if sandbox.is_on() {
+        return contained(cmd, cwd, timeout, started).await;
+    }
     let mut c = command(cmd);
     c.current_dir(cwd)
         .env("PYTHONUTF8", "1")
@@ -78,12 +152,28 @@ pub async fn shell(cmd: &str, cwd: &Path, timeout: Duration) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The rule set has to stay open until the child has switched it on.
+    #[cfg(target_os = "linux")]
+    let _rules = match sandbox {
+        Sandbox::On(policy) => match crate::sandbox::linux::Ruleset::new(policy) {
+            Ok(rules) => {
+                let fd = rules.fd();
+                // SAFETY: `restrict` makes two raw system calls and allocates nothing on success.
+                unsafe { c.pre_exec(move || crate::sandbox::linux::restrict(fd)) };
+                Some(rules)
+            }
+            Err(e) => return Output::not_started(format!("could not start the isolation: {e}")),
+        },
+        Sandbox::Off => None,
+    };
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = sandbox;
+
     let mut child = match c.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            return Output { code: None, text: format!("could not start the command: {e}"), timed_out: false, seconds: 0.0 };
-        }
+        Err(e) => return Output::not_started(format!("could not start the command: {e}")),
     };
+    let mut tree = Tree(child.id());
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let read_out = tokio::spawn(async move {
@@ -105,6 +195,7 @@ pub async fn shell(cmd: &str, cwd: &Path, timeout: Duration) -> Output {
             (None, true)
         }
     };
+    tree.ended();
     // After a kill a grandchild can still hold the pipe open; do not wait for it forever.
     let grace = Duration::from_secs(if timed_out { 2 } else { 10 });
     let collect = |h: tokio::task::JoinHandle<Vec<u8>>| async move {
@@ -118,18 +209,38 @@ pub async fn shell(cmd: &str, cwd: &Path, timeout: Duration) -> Output {
         }
     };
     let (out, err) = (collect(read_out).await, collect(read_err).await);
-    let mut text = String::from_utf8_lossy(&out).replace("\r\n", "\n");
-    let err = String::from_utf8_lossy(&err).replace("\r\n", "\n");
-    if !err.trim().is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+    finish(&out, &err, code, timed_out, timeout, started)
+}
+
+/// The Windows container path: the command runs on a blocking thread inside a job object.
+#[cfg(windows)]
+async fn contained(cmd: &str, cwd: &Path, timeout: Duration, started: Instant) -> Output {
+    use crate::sandbox::windows::{Job, run};
+    use std::sync::Arc;
+
+    /// Ends every process of the job unless the command ended by itself.
+    struct Guard(Arc<Job>, bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.1 {
+                self.0.kill();
+            }
         }
-        text.push_str(&err);
     }
-    if timed_out {
-        text.push_str(&format!("\n[stopped: no result within {} s]", timeout.as_secs()));
+
+    let job = match Job::new() {
+        Ok(job) => Arc::new(job),
+        Err(e) => return Output::not_started(format!("could not start the isolation: {e}")),
+    };
+    let mut guard = Guard(job.clone(), false);
+    let (cmd, cwd) = (cmd.to_string(), cwd.to_path_buf());
+    let result = tokio::task::spawn_blocking(move || run(&cmd, &cwd, timeout, &job)).await;
+    guard.1 = true;
+    match result {
+        Ok(Ok(raw)) => finish(&raw.out, &[], raw.code, raw.timed_out, timeout, started),
+        Ok(Err(e)) => Output::not_started(format!("could not start the command in the container: {e}")),
+        Err(e) => Output::not_started(format!("could not start the command: {e}")),
     }
-    Output { code, text: clip(text.trim_end(), HEAD, TAIL), timed_out, seconds: started.elapsed().as_secs_f32() }
 }
 
 #[cfg(test)]
@@ -162,5 +273,16 @@ mod tests {
         assert!(out.timed_out && out.code.is_none());
         assert!(out.seconds < 15.0, "{out:?}");
         assert!(out.text.contains("stopped"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_command_takes_its_processes_with_it() {
+        let dir = crate::testing::TempDir::new("drop");
+        // The marker appears only if the command lives past its wait.
+        let cmd = if cfg!(windows) { "ping -n 4 127.0.0.1 >nul & echo late> late.txt" } else { "sleep 2; echo late > late.txt" };
+        let run = shell(cmd, dir.path(), Duration::from_secs(30));
+        assert!(tokio::time::timeout(Duration::from_millis(400), run).await.is_err());
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert!(!dir.path().join("late.txt").exists(), "the command went on after it was dropped");
     }
 }

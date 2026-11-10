@@ -1,6 +1,7 @@
 //! The test gate: a "done" claim counts only after the project's own tests pass.
 
 use crate::exec;
+use crate::sandbox::Sandbox;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
@@ -47,11 +48,16 @@ impl Gate {
     }
 
     pub async fn run(&self, root: &Path) -> Verdict {
+        self.run_in(root, &Sandbox::Off).await
+    }
+
+    /// Run the check; a test command runs inside `sandbox` when it is on.
+    pub async fn run_in(&self, root: &Path, sandbox: &Sandbox) -> Verdict {
         match self {
             Gate::None => Verdict::NoTests,
             Gate::Custom(check) => check(root),
             Gate::Command { cmd, timeout } => {
-                let out = exec::shell(cmd, root, *timeout).await;
+                let out = exec::shell_in(sandbox, cmd, root, *timeout).await;
                 judge(cmd, out.code, &out.text)
             }
         }

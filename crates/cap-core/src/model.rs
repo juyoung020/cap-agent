@@ -1,5 +1,6 @@
 //! Messages, tool calls and the `Model` trait every provider implements.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
 
@@ -59,9 +60,23 @@ impl Message {
 /// A tool the model may call. `parameters` is a JSON Schema object.
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     pub parameters: serde_json::Value,
+}
+
+impl ToolSpec {
+    pub fn new(name: impl Into<Cow<'static, str>>, description: impl Into<Cow<'static, str>>, parameters: serde_json::Value) -> Self {
+        Self { name: name.into(), description: description.into(), parameters }
+    }
+}
+
+/// Whether the model may answer in text (`Auto`) or has to answer with a tool call (`Required`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    Required,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +85,7 @@ pub struct Request<'a> {
     pub tools: &'a [ToolSpec],
     pub max_tokens: u32,
     pub temperature: f32,
+    pub tool_choice: ToolChoice,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -139,4 +155,16 @@ impl std::error::Error for ModelError {}
 /// One chat completion. Implemented by the HTTP client and by the scripted model used in tests.
 pub trait Model: Sync {
     fn complete(&self, req: Request<'_>) -> impl Future<Output = Result<Reply, ModelError>> + Send;
+
+    /// The same call with the text handed to `on_text` while it arrives. The pieces add up to the
+    /// text a person should see; the full reply is still returned at the end.
+    fn stream(&self, req: Request<'_>, on_text: &(dyn Fn(&str) + Sync)) -> impl Future<Output = Result<Reply, ModelError>> + Send {
+        async move {
+            let reply = self.complete(req).await?;
+            if !reply.content.is_empty() {
+                on_text(&reply.content);
+            }
+            Ok(reply)
+        }
+    }
 }

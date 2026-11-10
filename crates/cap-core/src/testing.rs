@@ -2,7 +2,7 @@
 //!
 //! Public so the binary crate and integration tests can drive the real loop without a server.
 
-use crate::model::{ErrorKind, Finish, Message, Model, ModelError, Reply, Request, ToolCall, Usage};
+use crate::model::{ErrorKind, Finish, Message, Model, ModelError, Reply, Request, ToolCall, ToolChoice, Usage};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,6 +14,7 @@ pub struct Recorded {
     pub messages: Vec<Message>,
     pub tools: Vec<String>,
     pub max_tokens: u32,
+    pub tool_choice: ToolChoice,
 }
 
 /// Replies in order; after the script ends it repeats `fallback`, or fails when there is none.
@@ -52,6 +53,7 @@ impl Model for ScriptedModel {
             messages: req.messages.to_vec(),
             tools: req.tools.iter().map(|t| t.name.to_string()).collect(),
             max_tokens: req.max_tokens,
+            tool_choice: req.tool_choice,
         });
         match self.script.lock().unwrap().pop_front() {
             Some(next) => next,

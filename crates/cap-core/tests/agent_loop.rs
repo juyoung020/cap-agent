@@ -1,6 +1,6 @@
 //! The whole loop, driven by a scripted model in a temporary project.
 
-use cap_core::agent::{Agent, Config, Quiet, Report, Status};
+use cap_core::agent::{Agent, Config, Report, Status};
 use cap_core::gate::{self, Gate, Verdict};
 use cap_core::model::{ErrorKind, Role};
 use cap_core::perm::{AllowAll, Approver, DenyAll, Mode};
@@ -39,7 +39,7 @@ fn counted(runs: Arc<AtomicU32>) -> Gate {
 
 async fn run_with(t: &TempDir, model: &ScriptedModel, gate: &Gate, config: Config, approver: &dyn Approver) -> Report {
     let ws = Workspace::new(t.path()).unwrap();
-    let agent = Agent { model, ws: &ws, gate, approver, sink: &Quiet, config };
+    let agent = Agent { approver, config, ..Agent::new(model, &ws, gate) };
     agent.run("add() returns the wrong result. Fix it.").await
 }
 
@@ -70,7 +70,7 @@ async fn a_fix_that_passes_the_tests_is_verified() {
     // The first message carries the task and the file list, so the model can start without a listing call.
     let first = &model.requests()[0];
     assert!(first.messages[1].content.contains("Fix it.") && first.messages[1].content.contains("tests/test_calc.py"));
-    assert_eq!(first.tools, ["read_file", "list_files", "search", "edit_file", "write_file", "run_tests", "run"]);
+    assert_eq!(first.tools, ["read_file", "search", "replace_lines", "write_file", "run_tests", "run"]);
 }
 
 #[tokio::test]
@@ -227,7 +227,7 @@ async fn broken_arguments_are_explained_and_the_next_try_counts() {
     let out = results(&r);
     assert!(out[0].contains("not valid JSON"), "{}", out[0]);
     assert!(out[1].contains("one JSON object"), "{}", out[1]);
-    assert!(out[2].contains("no tool named make_coffee") && out[2].contains("edit_file"), "{}", out[2]);
+    assert!(out[2].contains("no tool named make_coffee") && out[2].contains("replace_lines"), "{}", out[2]);
     // Three rounds without one usable call end the run.
     assert!(matches!(r.status, Status::Stuck(_)), "{:?}", r.status);
     assert_eq!(model.calls(), 3);

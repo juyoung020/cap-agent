@@ -247,6 +247,12 @@ fn segments(cmd: &str) -> Vec<&str> {
     cmd.split(['|', '&', ';', '\n']).map(str::trim).filter(|s| !s.is_empty()).collect()
 }
 
+/// Whether a command needs what the isolation takes away (network, package stores, a git remote,
+/// more rights). Such a command always asks a person first; once approved it runs outside the isolation.
+pub fn leaves_isolation(cmd: &str) -> bool {
+    segments(cmd).into_iter().map(words).any(|w| always_ask(&w).is_some())
+}
+
 pub fn check_command(mode: Mode, cmd: &str) -> Decision {
     if cmd.trim().is_empty() {
         return Decision::Deny("the command is empty".into());
@@ -379,6 +385,9 @@ mod tests {
                 assert!(ask(check_command(mode, cmd)), "{cmd} in {mode:?}");
             }
         }
+        // Only the commands that need the network, a package store, a remote or more rights leave the isolation.
+        assert!(leaves_isolation("ls && pip install requests") && leaves_isolation("git push"));
+        assert!(!leaves_isolation("echo `whoami`") && !leaves_isolation("python script.py"));
     }
 
     #[test]

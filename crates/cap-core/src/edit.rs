@@ -232,6 +232,72 @@ pub fn apply_edit(text: &str, old: &str, new: &str) -> Result<Applied, EditError
     Err(EditError::NotFound { closest: closest(&hay, &needle) })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineEdit {
+    pub text: String,
+    /// First line of the replaced range, 1-based.
+    pub start: usize,
+    pub old_lines: usize,
+    pub new_lines: usize,
+    /// `new` came without any indentation and got that of the lines it replaces.
+    pub indented: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineError {
+    /// The range does not lie inside the file, which has `total` lines.
+    BadRange { total: usize },
+    /// The lines already read exactly like `new`.
+    Noop,
+}
+
+/// The lines of a text; the line end after the last line does not start another one.
+pub fn lines_of(text: &str) -> Vec<&str> {
+    if text.is_empty() { Vec::new() } else { text.strip_suffix('\n').unwrap_or(text).split('\n').collect() }
+}
+
+/// The indentation that `new` lacks: none of its lines has any, and every line it replaces has
+/// some. A small model often sends the changed statement alone, without its leading spaces.
+fn missing_indent<'a>(old: &[&'a str], new: &[&str]) -> Option<&'a str> {
+    let old: Vec<&'a str> = old.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+    let new: Vec<&str> = new.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+    let indent = indent_of(old.first()?);
+    let fits = !new.is_empty() && old.iter().all(|l| !indent_of(l).is_empty()) && new.iter().all(|l| indent_of(l).is_empty());
+    fits.then_some(indent)
+}
+
+/// Replace lines `start..=end` (1-based) with `new`. `end = start - 1` inserts before line `start`
+/// (`start = total + 1` appends); an empty `new` deletes the lines. A `new` without any
+/// indentation that replaces indented lines is indented like the first of them.
+pub fn replace_lines(text: &str, start: usize, end: usize, new: &str) -> Result<LineEdit, LineError> {
+    let lines = lines_of(text);
+    let total = lines.len();
+    if start < 1 || start > total + 1 || end + 1 < start || end > total {
+        return Err(LineError::BadRange { total });
+    }
+    // Line numbers copied from a `read_file` result are not part of the file.
+    let new = strip_line_numbers(new).unwrap_or_else(|| new.to_string());
+    let fresh = lines_of(&new);
+    let indent = missing_indent(&lines[start - 1..end], &fresh);
+    let shifted: Vec<String>;
+    let fresh: Vec<&str> = match indent {
+        Some(indent) => {
+            shifted = fresh.iter().map(|l| if l.trim().is_empty() { l.to_string() } else { format!("{indent}{l}") }).collect();
+            shifted.iter().map(String::as_str).collect()
+        }
+        None => fresh,
+    };
+    if lines[start - 1..end] == fresh[..] {
+        return Err(LineError::Noop);
+    }
+    let out: Vec<&str> = lines[..start - 1].iter().chain(&fresh).chain(&lines[end..]).copied().collect();
+    let mut joined = out.join("\n");
+    if !out.is_empty() && (text.is_empty() || text.ends_with('\n')) {
+        joined.push('\n');
+    }
+    Ok(LineEdit { text: joined, start, old_lines: end + 1 - start, new_lines: fresh.len(), indented: indent.is_some() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +372,62 @@ mod tests {
         assert_eq!(Eol::detect("a\nb\n"), Eol::Lf);
         let a = apply_edit(&Eol::to_lf(crlf), "b = 2", "b = 3").unwrap();
         assert_eq!(Eol::CrLf.restore(&a.text), "a = 1\r\nb = 3\r\n");
+    }
+
+    #[test]
+    fn a_line_range_is_replaced_inserted_or_deleted() {
+        let text = "a\nb\nc\n";
+        let r = replace_lines(text, 2, 2, "B1\nB2").unwrap();
+        assert_eq!((r.text.as_str(), r.start, r.old_lines, r.new_lines), ("a\nB1\nB2\nc\n", 2, 1, 2));
+        // `end = start - 1` inserts before `start`; `start = total + 1` appends.
+        assert_eq!(replace_lines(text, 1, 0, "top\n").unwrap().text, "top\na\nb\nc\n");
+        assert_eq!(replace_lines(text, 4, 3, "d").unwrap().text, "a\nb\nc\nd\n");
+        // An empty `new` deletes; "\n" is one empty line.
+        assert_eq!(replace_lines(text, 1, 2, "").unwrap().text, "c\n");
+        assert_eq!(replace_lines(text, 2, 2, "\n").unwrap().text, "a\n\nc\n");
+        // The file's last line end stays the way it was.
+        assert_eq!(replace_lines("a\nb", 2, 2, "B").unwrap().text, "a\nB");
+        assert_eq!(replace_lines("", 1, 0, "first").unwrap().text, "first\n");
+        assert_eq!(replace_lines("a\n", 1, 1, "").unwrap().text, "");
+    }
+
+    #[test]
+    fn copied_line_numbers_are_dropped_and_bad_ranges_are_named() {
+        let text = "def f():\n    return 1\n";
+        assert_eq!(replace_lines(text, 2, 2, "2|     return 2").unwrap().text, "def f():\n    return 2\n");
+        assert_eq!(replace_lines(text, 2, 2, "    return 1"), Err(LineError::Noop));
+        assert_eq!(replace_lines(text, 1, 0, ""), Err(LineError::Noop));
+        for (start, end) in [(0, 1), (4, 4), (2, 3), (3, 1)] {
+            assert_eq!(replace_lines(text, start, end, "x"), Err(LineError::BadRange { total: 2 }), "{start}-{end}");
+        }
+    }
+
+    #[test]
+    fn new_lines_without_indentation_get_that_of_the_lines_they_replace() {
+        let text = "def f(xs):\n    total = 0\n    for x in xs:\n        total += x\n    return total\n";
+        // The statement alone, as a small model sends it.
+        let r = replace_lines(text, 5, 5, "return total / len(xs)").unwrap();
+        assert!(r.indented && r.text.ends_with("\n    return total / len(xs)\n"), "{}", r.text);
+        let r = replace_lines(text, 4, 4, "4| total += 2 * x").unwrap();
+        assert!(r.indented && r.text.contains("\n        total += 2 * x\n"), "{}", r.text);
+        // Several flat lines move together; an empty line stays empty.
+        let r = replace_lines(text, 2, 2, "total = 0\n\ncount = 0").unwrap();
+        assert!(r.indented && r.text.starts_with("def f(xs):\n    total = 0\n\n    count = 0\n    for x"), "{}", r.text);
+        assert_eq!(r.new_lines, 3);
+        // Sent again, the line already reads like that.
+        assert_eq!(replace_lines(text, 5, 5, "return total"), Err(LineError::Noop));
+
+        // `new` that brings indentation of its own is written as it is.
+        let r = replace_lines(text, 5, 5, "  return total").unwrap();
+        assert!(!r.indented && r.text.ends_with("\n  return total\n"));
+        let r = replace_lines(text, 4, 4, "if x:\n    total += x").unwrap();
+        assert!(!r.indented && r.text.contains("\nif x:\n    total += x\n"));
+        // So is one that replaces a line at the left edge, and one that is inserted.
+        let r = replace_lines(text, 1, 2, "def g(xs):\ntotal = 1").unwrap();
+        assert!(!r.indented && r.text.starts_with("def g(xs):\ntotal = 1\n"));
+        let r = replace_lines(text, 6, 5, "print(f([1]))").unwrap();
+        assert!(!r.indented && r.text.ends_with("    return total\nprint(f([1]))\n"));
+        // Tabs are taken over as they are.
+        assert_eq!(replace_lines("f() {\n\treturn 1;\n}\n", 2, 2, "return 2;").unwrap().text, "f() {\n\treturn 2;\n}\n");
     }
 }
